@@ -1,0 +1,36 @@
+# Environment
+.env
+.env.local
+
+# Browser data and profiles
+data/taobao_*.json
+data/*_profile/
+scripts/data/
+
+# Scraped data exports
+data/images/
+data/exports/
+data/*.csv
+data/*.html
+data/*.json
+data/*.md
+
+# IDE
+.idea/
+.vscode/
+*.pyc
+__pycache__/
+
+# Python
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

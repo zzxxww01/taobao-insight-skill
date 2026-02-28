@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(du:*)",
+      "Bash(find C:\\\\Users\\\\DELL\\\\Desktop\\\\taobao-insight\\\\data:*)",
+      "Bash(rm:*)",
+      "WebSearch"
+    ]
+  }
+}
