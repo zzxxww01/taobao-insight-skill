@@ -6,7 +6,7 @@
 [![Playwright](https://img.shields.io/badge/Playwright-Enabled-green.svg)](https://playwright.dev/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[功能特性](#功能特性) • [安装](#安装) • [快速开始](#快速开始) • [配置说明](#配置说明) • [���见问题](#常见问题)
+[功能特性](#功能特性) • [安装](#安装) • [快速开始](#快速开始) • [配置说明](#配置说明) • [常见问题](#常见问题)
 
 ---
 
