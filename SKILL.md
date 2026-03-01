@@ -75,15 +75,23 @@ $env:PYTHONIOENCODING="utf-8"
 $env:TAOBAO_BROWSER_MODE="persistent"
 $env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\taobao_insight_profile"
 $env:TAOBAO_STORAGE_STATE_FILE="skills\\taobao-insight\\data\\taobao_storage_state.json"
-python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-workers 8 --taobao-browser-mode persistent final-csv "<用户提供的 keyword>" --top-n <用户指定的数字> --search-backend playwright --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
+python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-workers 64 --taobao-browser-mode persistent final-csv "<用户提供的 keyword>" --top-n <用户指定的数字> --search-backend playwright --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
 ```
 
 **关键参数说明**：
 - `--taobao-browser-mode persistent`: 使用持久化浏览器模式（**自动启动浏览器**，不需要手动启动 CDP）
 - `--use-global-browser 1`: 启用全局浏览器管理器（单一事件循环架构，登录只需一次）
 - `--crawl-workers 1`: 使用单一事件循环（重要：避免 Playwright 连接问题）
+- `--llm-workers 64`: LLM 并发数（Flash 模型默认 64，Pro 模型建议 16）
 - `--search-backend playwright`: 使用 Playwright 进行搜索（必须）
 - `--top-n N`: 抓取前 N 个商品
+
+#### 性能优化（2026-02-28）
+
+系统已启用**流水线并行**优化：
+- 爬虫和 LLM 处理**重叠执行**：当爬虫完成第 N 个商品时，立即开始 LLM 处理，无需等待所有爬虫完成
+- LLM 并发：Flash/Vision 模型 64 并发，Pro/Preview 模型 16 并发
+- 预期效果：30 条商品处理时间从 ~45 分钟优化至 ~10-15 分钟
 
 #### 登录态持久化要求（避免重复扫码）
 
@@ -138,6 +146,13 @@ python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-worker
 1. 按执行命令中指定的路径确认两个目标文件已生成：`data/exports/<keyword>-top<top_n>.html` 与 `data/exports/<keyword>-top<top_n>.md`
 2. 不要额外创建任何临时导出文件（例如 `*-products.*` 或其它额外副本）
 3. （重要）读取刚刚生成的 HTML 或 MD 中的关键结论，挑选其中最震撼的 1-2 点给用户高能预览！
+4. （必须）读取本次自动生成的运行总结文件：`data/exports/<workbook_name>-run-summary.md`，向用户报告：
+   - 总耗时（`total_runtime_sec`）
+   - 各阶段耗时（search/crawl/llm_extract/llm_analyze/export）
+   - 成功率（success_rate）
+   - 关键错误 TopN（如 `Page.goto ERR_ABORTED`）
+   - 关键结论（key_conclusion）
+5. （必须）读取关键步骤日志文件：`data/run_logs/<task_id>.jsonl`，若失败需指出失败集中在哪个阶段（search/crawl/llm_extract/llm_analyze/export）。
 
 例如向用户展示：
 ```
@@ -151,6 +166,12 @@ python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-worker
 - 已提取卖点：3 个
 - 有价格信息：5 个
 - 市场标签：粉饼、定妆、持久
+
+🧪 运行摘要：
+- 总耗时：207.629s
+- 成功率：100%
+- 关键错误：无
+- 关键结论：<从 run-summary.md 提取>
 ```
 
 ---
@@ -167,3 +188,30 @@ python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-worker
 8. **”浏览器显示登录成功但程序仍超时”**: 多数是页面仍被判定为登录态（未回到搜索页）。需要自动复检搜索结果页并在登录成功后立即落盘 cookie
 
 记住：本技能的超凡之处在于 **跨越极高反爬壁垒拿到底层网页** 且 **内化了大模型卖点萃取逻辑**，用清晰的流水线汇报进展并保证终端产出物的可用与可读。
+
+---
+
+## Stability Baseline (Validated 2026-03-01)
+
+Use this flow when you need maximum reproducibility and want to push sample success rate to 100%.
+
+1. Keep `--taobao-browser-mode persistent`, `--use-global-browser 1`, `--crawl-workers 1`.
+2. Freeze the sample set first, then run analysis with input URLs:
+   - Step A (optional): get top-N URLs from search.
+   - Step B (recommended): run `final-csv` with `--item-urls-file <frozen_urls.txt>`.
+3. Always read both artifacts after each run:
+   - `data/exports/<workbook>-run-summary.md`
+   - `data/run_logs/<task_id>.jsonl`
+4. Treat these as blocking errors and rerun after fix:
+   - `Browser not initialized`
+   - `launch_persistent_context ... TargetClosedError`
+   - repeated `Page.goto net::ERR_ABORTED`
+
+Reference command (PowerShell):
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+$env:TAOBAO_BROWSER_MODE="persistent"
+$env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\taobao_insight_profile"
+python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-workers 16 --taobao-browser-mode persistent final-csv "口红" --top-n 10 --search-backend playwright --item-urls-file "data/exports/kouhong-top10-urls.txt" --output "data/exports/taobao-kouhong-top10.md" --html-output "data/exports/taobao-kouhong-top10.html"
+```

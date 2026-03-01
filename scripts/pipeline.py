@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 import traceback
 import uuid
 import json
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +23,9 @@ from config import (
     load_simple_dotenv,
     DEFAULT_GROUP_CODE,
     MAX_TOP_N,
+    CRAWL_WORKERS,
+    LLM_WORKERS,
+    LLM_WORKERS_MIN,
 )
 from data import (
     GroupService,
@@ -166,14 +172,16 @@ class Pipeline:
 
     @staticmethod
     def _effective_crawl_workers(requested_workers: int) -> int:
-        # Keep Taobao crawling single-threaded for session stability.
-        requested = max(1, int(requested_workers))
-        if requested != 1:
+        try:
+            requested = max(1, int(requested_workers))
+        except (TypeError, ValueError):
+            requested = CRAWL_WORKERS
+        if requested > CRAWL_WORKERS:
             LOG.warning(
-                "crawl_workers=%s requested, but Taobao crawling is forced to 1",
+                "crawl_workers=%s configured; higher Taobao concurrency may increase anti-bot risk",
                 requested,
             )
-        return 1
+        return requested
 
     def _reset_login_recovery_events(self) -> None:
         if hasattr(self.search_client, "login_recovery_events"):
@@ -254,6 +262,177 @@ class Pipeline:
             detail_summary=merged_summary,
         )
         return merged_summary, points
+
+    def _run_logs_dir(self) -> Path:
+        path = self.storage.data_dir / "run_logs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _run_log_path(self, task_id: str) -> Path:
+        return self._run_logs_dir() / f"{task_id}.jsonl"
+
+    def _append_run_log(
+        self,
+        run_log_path: Path | None,
+        stage: str,
+        status: str = "info",
+        **fields: Any,
+    ) -> None:
+        if run_log_path is None:
+            return
+        payload = {
+            "ts": now_iso(),
+            "stage": stage,
+            "status": status,
+            **fields,
+        }
+        try:
+            with run_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            LOG.warning("failed to write run log %s: %s", run_log_path, exc)
+        LOG.info("[run-stage] %s %s %s", stage, status, clean_text(str(fields), 260))
+
+    @staticmethod
+    def _normalize_failure_reason(reason: str) -> str:
+        text = (reason or "").strip()
+        lowered = text.lower()
+        if "net::err_aborted" in lowered:
+            return "Page.goto ERR_ABORTED"
+        if "remoteprotocolerror" in lowered or "server disconnected" in lowered:
+            return "Gemini/HTTP disconnected"
+        if "servererror: 500" in lowered or "500 internal" in lowered:
+            return "Gemini 500 INTERNAL"
+        if "llm extraction failed" in lowered:
+            return "LLM extraction failed"
+        if "llm analyze failed" in lowered:
+            return "LLM analyze failed"
+        if "login" in lowered:
+            return "Login/session issue"
+        if "timeout" in lowered:
+            return "Timeout"
+        first_line = text.splitlines()[0] if text else ""
+        return clean_text(first_line or "Unknown", max_len=100)
+
+    @staticmethod
+    def _safe_slug(text: str, fallback: str) -> str:
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", (text or "").strip()).strip("-_")
+        return slug or fallback
+
+    def _write_run_summary(
+        self,
+        *,
+        task_id: str,
+        workbook_id: str,
+        workbook_name: str,
+        keyword: str,
+        status: str,
+        result_payload: dict[str, Any] | None,
+        error_text: str = "",
+        run_log_path: Path | None = None,
+    ) -> tuple[dict[str, Any], Path]:
+        task_payload = self.task_tracker.get(task_id)
+        failures = task_payload.get("failures", [])
+        if not isinstance(failures, list):
+            failures = []
+
+        total_items = int(task_payload.get("total_items", 0) or 0)
+        failure_count = len(failures)
+        success_count = max(0, total_items - failure_count)
+        error_counter: Counter[str] = Counter(
+            [self._normalize_failure_reason(str(f.get("reason", ""))) for f in failures if isinstance(f, dict)]
+        )
+        top_errors = [
+            {"reason": reason, "count": count}
+            for reason, count in error_counter.most_common(5)
+        ]
+
+        timings = (result_payload or {}).get("timings_sec", {})
+        if not isinstance(timings, dict):
+            timings = {}
+        total_sec = float(timings.get("total", 0) or 0)
+        final_conclusion = clean_text(
+            str((result_payload or {}).get("final_conclusion", "")), max_len=500
+        )
+        market_summary = clean_text(
+            str((result_payload or {}).get("market_summary", "")), max_len=500
+        )
+        key_conclusion = final_conclusion or market_summary or clean_text(error_text, 500)
+
+        summary_payload = {
+            "task_id": task_id,
+            "workbook_id": workbook_id,
+            "workbook_name": workbook_name,
+            "keyword": keyword,
+            "status": status,
+            "created_at": task_payload.get("created_at", ""),
+            "updated_at": task_payload.get("updated_at", ""),
+            "total_items": total_items,
+            "success_items": success_count,
+            "failed_items": failure_count,
+            "success_rate": round((success_count / total_items) * 100, 2) if total_items else 0.0,
+            "timings_sec": {},
+            "total_runtime_sec": round(total_sec, 3),
+            "top_errors": top_errors,
+            "key_conclusion": key_conclusion,
+            "error": clean_text(error_text, 500) if error_text else "",
+            "run_log_path": str(run_log_path) if run_log_path else "",
+        }
+        for key, value in timings.items():
+            try:
+                summary_payload["timings_sec"][key] = round(float(value), 3)
+            except Exception:
+                continue
+
+        slug = self._safe_slug(workbook_name, task_id)
+        summary_path = self.storage.exports_dir / f"{slug}-run-summary.md"
+        lines = [
+            "# 运行总结",
+            "",
+            f"- task_id: {task_id}",
+            f"- workbook_id: {workbook_id}",
+            f"- workbook_name: {workbook_name}",
+            f"- keyword: {keyword}",
+            f"- status: {status}",
+            f"- created_at: {task_payload.get('created_at', '')}",
+            f"- updated_at: {task_payload.get('updated_at', '')}",
+            "",
+            "## 运行时间",
+            f"- total_runtime_sec: {summary_payload['total_runtime_sec']}",
+        ]
+        for key in ("search", "crawl", "llm_extract", "llm_analyze", "export"):
+            if key in timings:
+                lines.append(f"- {key}: {timings.get(key)}")
+        lines.extend(
+            [
+                "",
+                "## 成功率",
+                f"- total_items: {total_items}",
+                f"- success_items: {success_count}",
+                f"- failed_items: {failure_count}",
+                f"- success_rate: {summary_payload['success_rate']}%",
+                "",
+                "## 关键错误",
+            ]
+        )
+        if top_errors:
+            for idx, item in enumerate(top_errors, start=1):
+                lines.append(f"{idx}. {item['reason']} ({item['count']})")
+        else:
+            lines.append("1. 无")
+        lines.extend(
+            [
+                "",
+                "## 关键结论",
+                key_conclusion or "无",
+            ]
+        )
+        if error_text:
+            lines.extend(["", "## 运行异常", clean_text(error_text, 1000)])
+        if run_log_path:
+            lines.extend(["", "## 关键步骤日志", str(run_log_path)])
+        summary_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return summary_payload, summary_path
 
     def _run_adaptive_stage(
         self,
@@ -438,7 +617,11 @@ class Pipeline:
             return status
         return "unknown"
 
-    def _collect_export_readiness(self, workbook_id: str) -> dict[str, Any]:
+    def _collect_export_readiness(
+        self,
+        workbook_id: str,
+        ignore_running_task_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
         rows = [r for r in self.storage.list_products() if r["workbook_id"] == workbook_id]
         if not rows:
             raise ValueError(f"no products found for workbook: {workbook_id}")
@@ -458,11 +641,16 @@ class Pipeline:
                 price_count += 1
 
         tasks = self.storage.list_tasks()
+        ignore_ids = set(ignore_running_task_ids or set())
         running_task_ids = sorted(
             [
                 task_id
                 for task_id, task in tasks.items()
-                if task.get("workbook_id") == workbook_id and task.get("status") == "running"
+                if (
+                    task.get("workbook_id") == workbook_id
+                    and task.get("status") == "running"
+                    and task_id not in ignore_ids
+                )
             ]
         )
 
@@ -485,8 +673,15 @@ class Pipeline:
             "has_market_summary": has_market_summary,
         }
 
-    def _assert_export_ready(self, workbook_id: str, allow_incomplete: bool = False) -> None:
-        stats = self._collect_export_readiness(workbook_id)
+    def _assert_export_ready(
+        self,
+        workbook_id: str,
+        allow_incomplete: bool = False,
+        ignore_running_task_ids: set[str] | None = None,
+    ) -> None:
+        stats = self._collect_export_readiness(
+            workbook_id, ignore_running_task_ids=ignore_running_task_ids
+        )
         if allow_incomplete:
             if stats["running_task_ids"]:
                 LOG.warning(
@@ -540,8 +735,13 @@ class Pipeline:
         output_path: str | None = None,
         html_output_path: str | None = None,
         allow_incomplete: bool = False,
+        ignore_running_task_ids: set[str] | None = None,
     ) -> tuple[Path, Path]:
-        self._assert_export_ready(workbook_id, allow_incomplete=allow_incomplete)
+        self._assert_export_ready(
+            workbook_id,
+            allow_incomplete=allow_incomplete,
+            ignore_running_task_ids=ignore_running_task_ids,
+        )
         derived_md = self._derive_md_output_path(
             workbook_id=workbook_id,
             md_output_path=output_path,
@@ -618,15 +818,23 @@ class Pipeline:
         output_path: str | None,
         html_output_path: str | None = None,
         input_urls: list[str] | None = None,
-        crawl_workers: int = 1,
+        crawl_workers: int = CRAWL_WORKERS,
         llm_workers: int = 24,
         llm_workers_min: int = 8,
     ) -> dict[str, Any]:
-        """Async version of run_keyword - uses single event loop to avoid Playwright connection issues"""
+        """Async version of run_keyword with run summary output."""
         run_started_at = time.perf_counter()
         keyword = keyword.strip()
         if not keyword:
             raise ValueError("keyword cannot be empty")
+        recovered_tasks = self.task_tracker.recover_orphaned_running(
+            stale_after_minutes=60
+        )
+        if recovered_tasks:
+            LOG.warning(
+                "Recovered orphaned running tasks before new run: %s",
+                ",".join(recovered_tasks),
+            )
         self._reset_login_recovery_events()
 
         workbook_name = (
@@ -636,7 +844,6 @@ class Pipeline:
         workbook = self.workbook_service.create(workbook_name)
         workbook_id = workbook["workbook_id"]
 
-        # Handle direct input URLs
         normalized_inputs: list[UrlRecord] = []
         seen_input_ids: set[str] = set()
         for raw_url in input_urls or []:
@@ -646,7 +853,6 @@ class Pipeline:
             seen_input_ids.add(rec.item_id)
             normalized_inputs.append(rec)
 
-        # Search phase - use async method directly
         search_started_at = time.perf_counter()
         if normalized_inputs:
             search_records = normalized_inputs[:top_n]
@@ -654,7 +860,6 @@ class Pipeline:
                 "Use %s direct input item URLs; skip search step", len(search_records)
             )
         else:
-            # Call async search method directly (not asyncio.run())
             search_records, _anti_bot_signal = await self.search_client._search_with_global_browser_async(
                 keyword=keyword,
                 top_n=top_n,
@@ -662,7 +867,6 @@ class Pipeline:
                 search_sort=search_sort,
                 official_only=shop_filter_enabled,
             )
-
         search_elapsed_sec = self._elapsed_seconds(search_started_at)
         if not search_records:
             raise RuntimeError(
@@ -680,8 +884,27 @@ class Pipeline:
             keyword=keyword,
             total_items=min(top_n, len(search_records)),
         )
+        run_log_path = self._run_log_path(task_id)
         effective_crawl_workers = self._effective_crawl_workers(crawl_workers)
         finished = 0
+        self._append_run_log(
+            run_log_path,
+            "run-start",
+            status="ok",
+            task_id=task_id,
+            workbook_id=workbook_id,
+            keyword=keyword,
+            top_n=top_n,
+            search_elapsed_sec=round(search_elapsed_sec, 3),
+            search_records=len(search_records),
+            crawl_workers=effective_crawl_workers,
+            llm_workers=max(1, int(llm_workers)),
+        )
+
+        crawl_elapsed_sec = 0.0
+        llm_extract_elapsed_sec = 0.0
+        llm_analyze_elapsed_sec = 0.0
+        export_elapsed_sec = 0.0
         try:
             products = self.storage.list_products()
             product_map = {(r["workbook_id"], r["item_id"]): r for r in products}
@@ -694,77 +917,93 @@ class Pipeline:
                     continue
                 self._apply_search_metadata(row, rec)
                 targets.append((rec, row))
+            self._append_run_log(
+                run_log_path,
+                "target-build",
+                status="ok",
+                target_count=len(targets),
+            )
 
-            # Crawl phase - use asyncio.gather instead of ThreadPoolExecutor
-            crawl_results: list[tuple[UrlRecord, dict[str, str], Any]] = []
             crawl_started_at = time.perf_counter()
+            llm_extract_started_at = time.perf_counter()
+            semaphore = asyncio.Semaphore(max(1, effective_crawl_workers))
 
-            async def crawl_single_item(rec: UrlRecord, row: dict) -> tuple:
-                """Async wrapper for single item crawl using global browser"""
-                try:
-                    # Call the new async crawl method that uses global browser directly
+            async def crawl_single_item(rec: UrlRecord, row: dict) -> tuple[UrlRecord, dict[str, str], ItemDetail]:
+                async with semaphore:
+                    self._append_run_log(
+                        run_log_path,
+                        "crawl-item-start",
+                        status="ok",
+                        item_id=rec.item_id,
+                    )
                     detail = await self.crawler.crawl_async_global(
                         url=rec.normalized_url,
                         item_id=rec.item_id,
                         workbook_id=workbook_id,
                     )
-                    return rec, row, detail
-                except Exception as exc:
-                    import logging
-                    logging.error(f"Crawl failed for {rec.item_id}: {exc}")
-                    from scripts.data import ItemDetail, now_iso
-                    detail = ItemDetail(
-                        item_id=rec.item_id,
-                        title="",
-                        main_image_url="",
-                        shop_name="",
-                        brand="",
-                        prices=[],
-                        skus=[],
-                        detail_summary="",
-                        detail_text="",
-                        detail_blocks=[],
-                        citations=[],
-                        crawl_time=now_iso(),
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
+                    if detail.error:
+                        self._append_run_log(
+                            run_log_path,
+                            "crawl-item-end",
+                            status="error",
+                            item_id=rec.item_id,
+                            error=clean_text(detail.error, max_len=180),
+                        )
+                    else:
+                        self._append_run_log(
+                            run_log_path,
+                            "crawl-item-end",
+                            status="ok",
+                            item_id=rec.item_id,
+                        )
                     return rec, row, detail
 
-            # Create crawl tasks
-            crawl_tasks = [
-                crawl_single_item(rec, row)
-                for rec, row in targets
-            ]
+            crawl_tasks = [asyncio.create_task(crawl_single_item(rec, row)) for rec, row in targets]
+            llm_extract_executor = ThreadPoolExecutor(max_workers=max(1, int(llm_workers)))
+            pending_llm_futures: list[tuple[tuple[UrlRecord, dict[str, str], ItemDetail], Any]] = []
+            crawl_success = 0
+            crawl_fail = 0
 
-            # Run crawls sequentially (or use asyncio.gather() for concurrency)
-            # Sequential for now to avoid race conditions
-            for task in crawl_tasks:
-                result = await task
-                crawl_results.append(result)
-
-            crawl_elapsed_sec = self._elapsed_seconds(crawl_started_at)
-
-            llm_inputs: list[tuple[UrlRecord, dict[str, str], ItemDetail]] = []
-            for rec, row, detail in crawl_results:
+            for coro in asyncio.as_completed(crawl_tasks):
+                rec, row, detail = await coro
                 if detail.error:
+                    crawl_fail += 1
                     self.task_tracker.add_failure(task_id, rec.item_id, detail.error)
                     finished += 1
                     self.task_tracker.update_progress(task_id, finished)
                     continue
-                self._apply_crawl_detail(row, detail)
-                llm_inputs.append((rec, row, detail))
 
-            llm_extract_started_at = time.perf_counter()
-            llm_results = self._run_adaptive_stage(
-                items=llm_inputs,
-                worker_fn=lambda payload: self._extract_points_for_detail(payload[2]),
-                max_workers=llm_workers,
-                min_workers=llm_workers_min,
-                stage_name="llm-extract",
+                crawl_success += 1
+                self._apply_crawl_detail(row, detail)
+                future = llm_extract_executor.submit(self._extract_points_for_detail, detail)
+                pending_llm_futures.append(((rec, row, detail), future))
+
+            # Crawl stage ends when all crawl coroutines are done; LLM extraction futures
+            # may still be running in the background.
+            crawl_elapsed_sec = self._elapsed_seconds(crawl_started_at)
+            self._append_run_log(
+                run_log_path,
+                "crawl-stage-end",
+                status="ok",
+                crawl_success=crawl_success,
+                crawl_failed=crawl_fail,
+                crawl_elapsed_sec=round(crawl_elapsed_sec, 3),
             )
-            for payload, llm_result in zip(llm_inputs, llm_results):
+
+            llm_extract_results: list[tuple[tuple[UrlRecord, dict[str, str], ItemDetail], Any]] = []
+            for payload, future in pending_llm_futures:
+                try:
+                    llm_extract_results.append((payload, future.result()))
+                except Exception as llm_error:
+                    llm_extract_results.append((payload, llm_error))
+            llm_extract_executor.shutdown(wait=True)
+
+            llm_extract_success = 0
+            llm_extract_fail = 0
+            for payload, llm_result in llm_extract_results:
                 rec, row, detail = payload
                 if isinstance(llm_result, Exception):
+                    llm_extract_fail += 1
                     self.task_tracker.add_failure(
                         task_id, rec.item_id, f"LLM extraction failed: {llm_result}"
                     )
@@ -775,6 +1014,7 @@ class Pipeline:
                     self.task_tracker.update_progress(task_id, finished)
                     continue
 
+                llm_extract_success += 1
                 detail_summary, points = llm_result
                 row["detail_summary"] = detail_summary or detail.detail_summary
                 if points:
@@ -803,6 +1043,14 @@ class Pipeline:
                 finished += 1
                 self.task_tracker.update_progress(task_id, finished)
             llm_extract_elapsed_sec = self._elapsed_seconds(llm_extract_started_at)
+            self._append_run_log(
+                run_log_path,
+                "llm-extract-end",
+                status="ok",
+                llm_extract_success=llm_extract_success,
+                llm_extract_failed=llm_extract_fail,
+                llm_extract_elapsed_sec=round(llm_extract_elapsed_sec, 3),
+            )
 
             workbook_rows = [r for r in products if r["workbook_id"] == workbook_id]
             workbook_points_map = self._build_workbook_points_map(
@@ -827,9 +1075,11 @@ class Pipeline:
                 min_workers=llm_workers_min,
                 stage_name="llm-analyze",
             )
+            llm_analyze_fail = 0
             for payload, analyze_result in zip(analyze_inputs, analyze_results):
                 row, _ = payload
                 if isinstance(analyze_result, Exception):
+                    llm_analyze_fail += 1
                     self.task_tracker.add_failure(
                         task_id,
                         row["item_id"],
@@ -844,6 +1094,14 @@ class Pipeline:
                 row["process_status"] = "4"
                 row["updated_at"] = now_iso()
             llm_analyze_elapsed_sec = self._elapsed_seconds(llm_analyze_started_at)
+            self._append_run_log(
+                run_log_path,
+                "llm-analyze-end",
+                status="ok",
+                llm_analyze_inputs=len(analyze_inputs),
+                llm_analyze_failed=llm_analyze_fail,
+                llm_analyze_elapsed_sec=round(llm_analyze_elapsed_sec, 3),
+            )
 
             export_started_at = time.perf_counter()
             (
@@ -866,7 +1124,8 @@ class Pipeline:
                 workbook_id=workbook_id,
                 output_path=output_path,
                 html_output_path=html_output_path,
-                allow_incomplete=True,
+                allow_incomplete=False,
+                ignore_running_task_ids={task_id},
             )
             export_elapsed_sec = self._elapsed_seconds(export_started_at)
             total_elapsed_sec = self._elapsed_seconds(run_started_at)
@@ -899,12 +1158,68 @@ class Pipeline:
                     "total": round(total_elapsed_sec, 3),
                 },
             }
+            summary_payload, summary_path = self._write_run_summary(
+                task_id=task_id,
+                workbook_id=workbook_id,
+                workbook_name=workbook["workbook_name"],
+                keyword=keyword,
+                status="completed",
+                result_payload=result,
+                run_log_path=run_log_path,
+            )
+            result["run_summary"] = summary_payload
+            result["run_summary_path"] = str(summary_path)
+            result["run_log_path"] = str(run_log_path)
             self.task_tracker.complete(task_id, "completed", result)
+            self._append_run_log(
+                run_log_path,
+                "run-end",
+                status="ok",
+                success_rate=summary_payload.get("success_rate", 0),
+                failed_items=summary_payload.get("failed_items", 0),
+                total_runtime_sec=summary_payload.get("total_runtime_sec", 0),
+                run_summary_path=str(summary_path),
+            )
             return result
 
         except Exception as exc:
-            self.task_tracker.complete(
-                task_id, "failed", {"error": f"{type(exc).__name__}: {exc}"}
+            error_text = f"{type(exc).__name__}: {exc}"
+            fail_result = {
+                "workbook_id": workbook_id,
+                "workbook_name": workbook_name,
+                "task_id": task_id,
+                "timings_sec": {
+                    "search": round(search_elapsed_sec, 3),
+                    "crawl": round(crawl_elapsed_sec, 3),
+                    "llm_extract": round(llm_extract_elapsed_sec, 3),
+                    "llm_analyze": round(llm_analyze_elapsed_sec, 3),
+                    "export": round(export_elapsed_sec, 3),
+                    "total": round(self._elapsed_seconds(run_started_at), 3),
+                },
+            }
+            summary_payload, summary_path = self._write_run_summary(
+                task_id=task_id,
+                workbook_id=workbook_id,
+                workbook_name=workbook_name,
+                keyword=keyword,
+                status="failed",
+                result_payload=fail_result,
+                error_text=error_text,
+                run_log_path=run_log_path,
+            )
+            failed_payload = {
+                "error": error_text,
+                "run_summary": summary_payload,
+                "run_summary_path": str(summary_path),
+                "run_log_path": str(run_log_path),
+            }
+            self.task_tracker.complete(task_id, "failed", failed_payload)
+            self._append_run_log(
+                run_log_path,
+                "run-end",
+                status="error",
+                error=clean_text(error_text, max_len=300),
+                run_summary_path=str(summary_path),
             )
             raise
 
@@ -920,7 +1235,7 @@ class Pipeline:
         output_path: str | None,
         html_output_path: str | None = None,
         input_urls: list[str] | None = None,
-        crawl_workers: int = 1,
+        crawl_workers: int = CRAWL_WORKERS,
         llm_workers: int = 24,
         llm_workers_min: int = 8,
     ) -> dict[str, Any]:
@@ -928,6 +1243,14 @@ class Pipeline:
         keyword = keyword.strip()
         if not keyword:
             raise ValueError("keyword cannot be empty")
+        recovered_tasks = self.task_tracker.recover_orphaned_running(
+            stale_after_minutes=60
+        )
+        if recovered_tasks:
+            LOG.warning(
+                "Recovered orphaned running tasks before new run: %s",
+                ",".join(recovered_tasks),
+            )
         self._reset_login_recovery_events()
 
         workbook_name = (
@@ -993,10 +1316,17 @@ class Pipeline:
                 self._apply_search_metadata(row, rec)
                 targets.append((rec, row))
 
-            crawl_results: list[tuple[UrlRecord, dict[str, str], ItemDetail]] = []
+            # Crawl phase - Pipeline parallel: start LLM Extract as soon as each crawl completes
             crawl_started_at = time.perf_counter()
+            llm_extract_started_at = time.perf_counter()  # Start LLM timer early for pipeline stats
+
+            llm_inputs: list[tuple[UrlRecord, dict[str, str], ItemDetail]] = []
+            pending_llm_futures: list[tuple[tuple, Any]] = []
+
             if targets:
                 pool_size = max(1, min(effective_crawl_workers, len(targets)))
+                llm_extract_executor = ThreadPoolExecutor(max_workers=llm_workers)
+
                 with ThreadPoolExecutor(max_workers=pool_size) as executor:
                     future_to_target = {
                         executor.submit(
@@ -1027,28 +1357,37 @@ class Pipeline:
                                 crawl_time=now_iso(),
                                 error=f"{type(exc).__name__}: {exc}",
                             )
-                        crawl_results.append((rec, row, detail))
+
+                        if detail.error:
+                            self.task_tracker.add_failure(task_id, rec.item_id, detail.error)
+                            finished += 1
+                            self.task_tracker.update_progress(task_id, finished)
+                            continue
+
+                        self._apply_crawl_detail(row, detail)
+                        llm_inputs.append((rec, row, detail))
+
+                        # Immediately submit to LLM Extract (pipeline parallel)
+                        llm_future = llm_extract_executor.submit(
+                            self._extract_points_for_detail, detail
+                        )
+                        pending_llm_futures.append(((rec, row, detail), llm_future))
+
+                llm_extract_executor.shutdown(wait=True)
+
             crawl_elapsed_sec = self._elapsed_seconds(crawl_started_at)
 
-            llm_inputs: list[tuple[UrlRecord, dict[str, str], ItemDetail]] = []
-            for rec, row, detail in crawl_results:
-                if detail.error:
-                    self.task_tracker.add_failure(task_id, rec.item_id, detail.error)
-                    finished += 1
-                    self.task_tracker.update_progress(task_id, finished)
-                    continue
-                self._apply_crawl_detail(row, detail)
-                llm_inputs.append((rec, row, detail))
+            # Wait for all LLM Extract tasks to complete
+            llm_extract_results: list[tuple[tuple, Any]] = []
+            for payload, future in pending_llm_futures:
+                try:
+                    llm_result = future.result()
+                    llm_extract_results.append((payload, llm_result))
+                except Exception as llm_error:
+                    llm_extract_results.append((payload, llm_error))
 
-            llm_extract_started_at = time.perf_counter()
-            llm_results = self._run_adaptive_stage(
-                items=llm_inputs,
-                worker_fn=lambda payload: self._extract_points_for_detail(payload[2]),
-                max_workers=llm_workers,
-                min_workers=llm_workers_min,
-                stage_name="llm-extract",
-            )
-            for payload, llm_result in zip(llm_inputs, llm_results):
+            # Process LLM Extract results
+            for payload, llm_result in llm_extract_results:
                 rec, row, detail = payload
                 if isinstance(llm_result, Exception):
                     self.task_tracker.add_failure(
@@ -1152,7 +1491,8 @@ class Pipeline:
                 workbook_id=workbook_id,
                 output_path=output_path,
                 html_output_path=html_output_path,
-                allow_incomplete=True,
+                allow_incomplete=False,
+                ignore_running_task_ids={task_id},
             )
             export_elapsed_sec = self._elapsed_seconds(export_started_at)
             total_elapsed_sec = self._elapsed_seconds(run_started_at)
@@ -1198,7 +1538,7 @@ class Pipeline:
         only_status: str = "1",
         output_path: str | None = None,
         html_output_path: str | None = None,
-        crawl_workers: int = 1,
+        crawl_workers: int = CRAWL_WORKERS,
         llm_workers: int = 24,
         llm_workers_min: int = 8,
     ) -> dict[str, Any]:
@@ -1232,9 +1572,16 @@ class Pipeline:
             ):
                 row["source_type"] = "official"
 
-        crawl_results: list[tuple[dict[str, str], ItemDetail]] = []
+        # Crawl phase - Pipeline parallel: start LLM Extract as soon as each crawl completes
         crawl_started_at = time.perf_counter()
+        llm_extract_started_at = time.perf_counter()  # Start LLM timer early for pipeline stats
+
+        llm_inputs: list[tuple[dict[str, str], ItemDetail]] = []
+        pending_llm_futures: list[tuple[tuple, Any]] = []
+
         pool_size = max(1, min(effective_crawl_workers, len(targets)))
+        llm_extract_executor = ThreadPoolExecutor(max_workers=llm_workers)
+
         with ThreadPoolExecutor(max_workers=pool_size) as executor:
             future_to_row = {
                 executor.submit(
@@ -1265,28 +1612,36 @@ class Pipeline:
                         crawl_time=now_iso(),
                         error=f"{type(exc).__name__}: {exc}",
                     )
-                crawl_results.append((row, detail))
+
+                if detail.error:
+                    self.task_tracker.add_failure(task_id, row["item_id"], detail.error)
+                    finished += 1
+                    self.task_tracker.update_progress(task_id, finished)
+                    continue
+
+                self._apply_crawl_detail(row, detail)
+                llm_inputs.append((row, detail))
+
+                # Immediately submit to LLM Extract (pipeline parallel)
+                llm_future = llm_extract_executor.submit(
+                    self._extract_points_for_detail, detail
+                )
+                pending_llm_futures.append(((row, detail), llm_future))
+
+        llm_extract_executor.shutdown(wait=True)
         crawl_elapsed_sec = self._elapsed_seconds(crawl_started_at)
 
-        llm_inputs: list[tuple[dict[str, str], ItemDetail]] = []
-        for row, detail in crawl_results:
-            if detail.error:
-                self.task_tracker.add_failure(task_id, row["item_id"], detail.error)
-                finished += 1
-                self.task_tracker.update_progress(task_id, finished)
-                continue
-            self._apply_crawl_detail(row, detail)
-            llm_inputs.append((row, detail))
+        # Wait for all LLM Extract tasks to complete
+        llm_extract_results: list[tuple[tuple, Any]] = []
+        for payload, future in pending_llm_futures:
+            try:
+                llm_result = future.result()
+                llm_extract_results.append((payload, llm_result))
+            except Exception as llm_error:
+                llm_extract_results.append((payload, llm_error))
 
-        llm_extract_started_at = time.perf_counter()
-        llm_results = self._run_adaptive_stage(
-            items=llm_inputs,
-            worker_fn=lambda payload: self._extract_points_for_detail(payload[1]),
-            max_workers=llm_workers,
-            min_workers=llm_workers_min,
-            stage_name="llm-extract",
-        )
-        for payload, llm_result in zip(llm_inputs, llm_results):
+        # Process LLM Extract results
+        for payload, llm_result in llm_extract_results:
             row, detail = payload
             if isinstance(llm_result, Exception):
                 self.task_tracker.add_failure(
@@ -1392,7 +1747,8 @@ class Pipeline:
             workbook_id=workbook_id,
             output_path=output_path,
             html_output_path=html_output_path,
-            allow_incomplete=True,
+            allow_incomplete=False,
+            ignore_running_task_ids={task_id},
         )
         export_elapsed_sec = self._elapsed_seconds(export_started_at)
         total_elapsed_sec = self._elapsed_seconds(run_started_at)
@@ -1453,9 +1809,9 @@ def build_parser() -> argparse.ArgumentParser:
     gemini_timeout_default = 45
     gemini_pro_retries_default = 2
     shop_filter_default = (os.getenv("SHOP_FILTER", "on") or "on").strip().lower()
-    crawl_workers_default = 1
-    llm_workers_default = 24
-    llm_workers_min_default = 8
+    crawl_workers_default = CRAWL_WORKERS
+    llm_workers_default = LLM_WORKERS  # 64 for Flash/Vision models
+    llm_workers_min_default = LLM_WORKERS_MIN  # 32
     try:
         manual_wait_default = max(0, int(os.getenv("MANUAL_WAIT_SECONDS", "0")))
     except ValueError:
@@ -1489,17 +1845,19 @@ def build_parser() -> argparse.ArgumentParser:
     if shop_filter_default not in {"on", "off"}:
         shop_filter_default = "on"
     try:
-        crawl_workers_default = max(1, int(os.getenv("CRAWL_WORKERS", "1")))
+        crawl_workers_default = max(
+            1, int(os.getenv("CRAWL_WORKERS", str(CRAWL_WORKERS)))
+        )
     except ValueError:
-        crawl_workers_default = 1
+        crawl_workers_default = CRAWL_WORKERS
     try:
-        llm_workers_default = max(1, int(os.getenv("LLM_WORKERS", "24")))
+        llm_workers_default = max(1, int(os.getenv("LLM_WORKERS", str(LLM_WORKERS))))
     except ValueError:
-        llm_workers_default = 24
+        llm_workers_default = LLM_WORKERS
     try:
-        llm_workers_min_default = max(1, int(os.getenv("LLM_WORKERS_MIN", "8")))
+        llm_workers_min_default = max(1, int(os.getenv("LLM_WORKERS_MIN", str(LLM_WORKERS_MIN))))
     except ValueError:
-        llm_workers_min_default = 8
+        llm_workers_min_default = LLM_WORKERS_MIN
     if llm_workers_min_default > llm_workers_default:
         llm_workers_min_default = llm_workers_default
 
@@ -1622,19 +1980,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--crawl-workers",
         type=int,
         default=crawl_workers_default,
-        help="Concurrent workers for item crawling (forced to 1 for Taobao stability)",
+        help="Concurrent workers for item crawling (default: 1; higher values may increase anti-bot risk)",
     )
     parser.add_argument(
         "--llm-workers",
         type=int,
         default=llm_workers_default,
-        help="Max concurrent workers for LLM extraction/analysis",
+        help="Max concurrent workers for LLM extraction/analysis (default: 64 for Flash model)",
     )
     parser.add_argument(
         "--llm-workers-min",
         type=int,
         default=llm_workers_min_default,
-        help="Min concurrent workers after transient errors",
+        help="Min concurrent workers after transient errors (default: 32)",
     )
     parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -1946,6 +2304,19 @@ def main(argv: list[str] | None = None) -> int:
                 LOG.warning(f"Browser cleanup failed (non-critical): {cleanup_exc}")
 
             print_json(payload)
+
+            # Print timing summary
+            if "timings_sec" in payload:
+                t = payload["timings_sec"]
+                LOG.info(
+                    f"Timing summary: search={t.get('search', 0):.1f}s, "
+                    f"crawl={t.get('crawl', 0):.1f}s, "
+                    f"llm_extract={t.get('llm_extract', 0):.1f}s, "
+                    f"llm_analyze={t.get('llm_analyze', 0):.1f}s, "
+                    f"export={t.get('export', 0):.1f}s, "
+                    f"total={t.get('total', 0):.1f}s"
+                )
+
             return 0
         if args.command == "create-workbook":
             print_json(workbook_service.create(args.workbook_name))

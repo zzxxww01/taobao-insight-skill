@@ -177,3 +177,10 @@ def load_simple_dotenv(path: Path) -> None:
         env_val = value.strip().strip('"').strip("'")
         if env_key and env_key not in os.environ:
             os.environ[env_key] = env_val
+
+
+# LLM concurrency settings
+CRAWL_WORKERS = 1  # Default concurrent workers for Taobao crawling
+LLM_WORKERS = 64  # Max concurrent workers for Flash/Vision models (extraction, analysis)
+LLM_WORKERS_MIN = 32  # Min concurrent workers after transient errors
+LLM_WORKERS_PRO = 16  # Concurrent workers for Pro/Preview models (market report)

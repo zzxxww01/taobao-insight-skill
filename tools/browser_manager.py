@@ -120,14 +120,35 @@ class GlobalBrowserManager:
                         "--disable-blink-features=AutomationControlled",
                     ]
 
-                    self.browser_context = await self.playwright.chromium.launch_persistent_context(
-                        user_data_dir=str(user_data_path),
-                        headless=headless,
-                        args=args,
-                        viewport={"width": 1920, "height": 1080},
-                        channel="chrome",
-                        user_agent=user_agent or None,
-                    )
+                    launch_kwargs = {
+                        "headless": headless,
+                        "args": args,
+                        "viewport": {"width": 1920, "height": 1080},
+                        "channel": "chrome",
+                        "user_agent": user_agent or None,
+                    }
+                    try:
+                        self.browser_context = await self.playwright.chromium.launch_persistent_context(
+                            user_data_dir=str(user_data_path),
+                            **launch_kwargs,
+                        )
+                    except Exception as launch_exc:
+                        # Profile corruption/lock is common after abrupt interruption on Windows.
+                        fallback_path = (
+                            user_data_path.parent / f"{user_data_path.name}_runtime"
+                        ).resolve()
+                        fallback_path.mkdir(parents=True, exist_ok=True)
+                        utils.logger.warning(
+                            "[GlobalBrowserManager] Persistent profile launch failed for %s, "
+                            "fallback to %s: %s",
+                            user_data_path,
+                            fallback_path,
+                            launch_exc,
+                        )
+                        self.browser_context = await self.playwright.chromium.launch_persistent_context(
+                            user_data_dir=str(fallback_path),
+                            **launch_kwargs,
+                        )
 
                     # Add stealth script
                     stealth_path = Path(__file__).parent.parent / "libs" / "stealth.min.js"
@@ -203,43 +224,46 @@ class GlobalBrowserManager:
         if not self._initialized or not self.browser_context:
             raise RuntimeError("Browser not initialized. Call initialize() first.")
 
+        def _is_target_closed_error(exc: Exception) -> bool:
+            text = str(exc).lower()
+            return "target page" in text and "closed" in text
+
         # Use lock to prevent concurrent page creation issues
         async with self._context_lock:
-            # Try to find an existing page
-            pages = self.browser_context.pages
-            if pages:
-                page = pages[0]
-            else:
-                page = await self.browser_context.new_page()
+            # Try to find an existing non-closed page
+            pages = [p for p in self.browser_context.pages if not p.is_closed()]
+            page = pages[0] if pages else await self.browser_context.new_page()
 
             if url:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                except Exception as exc:
+                    # Recover once when page/context was recycled unexpectedly.
+                    if _is_target_closed_error(exc):
+                        try:
+                            if not page.is_closed():
+                                await page.close()
+                        except Exception:
+                            pass
+                        page = await self.browser_context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    else:
+                        raise
 
             return page
 
     async def new_page(self) -> Page:
-        """Create a new page with lock protection"""
+        """Create a brand-new page with lock protection.
+
+        Do not reuse existing pages here: crawl workers may run concurrently and
+        each worker must own its own page to avoid navigation interruption.
+        """
         if not self._initialized or not self.browser_context:
             raise RuntimeError("Browser not initialized. Call initialize() first.")
 
         async with self._context_lock:
             try:
-                # Try to reuse existing pages instead of creating new ones
-                pages = self.browser_context.pages
-                if pages:
-                    # Reuse the first page
-                    page = pages[0]
-                    utils.logger.info(f"[GlobalBrowserManager] Reusing existing page: {page}")
-                    # Navigate to blank if needed
-                    if page.url != "about:blank":
-                        try:
-                            await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
-                        except Exception:
-                            pass
-                    return page
-
-                # If no pages exist, try to create a new one
-                utils.logger.info("[GlobalBrowserManager] No existing pages, creating new page")
+                utils.logger.info("[GlobalBrowserManager] Creating isolated new page")
                 page = await self.browser_context.new_page()
                 utils.logger.info(f"[GlobalBrowserManager] Successfully created new page: {page}")
                 return page

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -2806,160 +2807,215 @@ class Crawler:
         current_url = ""
         detail_blocks: list[dict[str, str]] = []
 
-        try:
-            # Get the global browser manager (should already be initialized)
-            global_manager = await get_global_browser_manager()
-
-            # Get or create a page for crawling
-            page = await global_manager.get_page()
-
-            # Navigate to the item page
-            await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-            await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
-
-            # Check for non-product page (login required, blocked, etc.)
-            initial_reason = detect_non_product_page(
-                page.url, await page.title(), await page.inner_text("body")
+        def _is_retryable_navigation_error(message: str) -> bool:
+            text = (message or "").lower()
+            return any(
+                token in text
+                for token in (
+                    "net::err_aborted",
+                    "net::err_connection_reset",
+                    "navigation interrupted",
+                    "timeout",
+                    "target page, context or browser has been closed",
+                )
             )
-            if initial_reason:
-                recovered = False
-                if TOOLS_AVAILABLE:
-                    LOG.warning(
-                        "item page blocked for item %s, trying login recovery once: %s",
-                        item_id,
-                        initial_reason,
+
+        max_nav_attempts = 3
+        for nav_attempt in range(1, max_nav_attempts + 1):
+            page = None
+            try:
+                # Get the global browser manager (should already be initialized)
+                global_manager = await get_global_browser_manager()
+                if not global_manager.is_initialized:
+                    await global_manager.initialize(
+                        browser_mode=self.browser_mode,
+                        headless=self.headless,
+                        cdp_url=self.cdp_url,
+                        user_data_dir=str(self.user_data_dir),
                     )
-                    login_handler = TaobaoLogin(
-                        browser_context=global_manager.browser_context,
-                        context_page=page,
-                        login_timeout_sec=self.manual_login_timeout_sec,
-                    )
-                    login_result: LoginHandleResult = await login_handler.check_and_handle_login()
-                    self.login_recovery_events.append(
-                        {
-                            "source": "crawl",
-                            "stage": "item-initial",
-                            "item_id": item_id,
-                            "ok": bool(login_result.ok),
-                            "blocked_reason": initial_reason,
-                            "final_state": login_result.final_state,
-                            "reason": login_result.reason,
-                            "elapsed_sec": round(float(login_result.elapsed_sec), 3),
-                            "url": page.url,
-                            "decision_trace": login_result.decision_trace,
-                            "updated_at": now_iso(),
-                        }
-                    )
-                    if login_result.ok:
-                        await self._persist_storage_state_async(global_manager.browser_context)
-                        await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-                        await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
-                        retry_reason = detect_non_product_page(
-                            page.url, await page.title(), await page.inner_text("body")
+
+                # Each crawl should use an isolated page to avoid cross-task navigation interruption.
+                page = await global_manager.new_page()
+
+                # Navigate to the item page
+                await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+                await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
+
+                # Check for non-product page (login required, blocked, etc.)
+                initial_reason = detect_non_product_page(
+                    page.url, await page.title(), await page.inner_text("body")
+                )
+                if initial_reason:
+                    recovered = False
+                    if TOOLS_AVAILABLE:
+                        LOG.warning(
+                            "item page blocked for item %s, trying login recovery once: %s",
+                            item_id,
+                            initial_reason,
                         )
-                        if not retry_reason:
-                            recovered = True
+                        login_handler = TaobaoLogin(
+                            browser_context=global_manager.browser_context,
+                            context_page=page,
+                            login_timeout_sec=self.manual_login_timeout_sec,
+                        )
+                        login_result: LoginHandleResult = await login_handler.check_and_handle_login()
+                        self.login_recovery_events.append(
+                            {
+                                "source": "crawl",
+                                "stage": "item-initial",
+                                "item_id": item_id,
+                                "ok": bool(login_result.ok),
+                                "blocked_reason": initial_reason,
+                                "final_state": login_result.final_state,
+                                "reason": login_result.reason,
+                                "elapsed_sec": round(float(login_result.elapsed_sec), 3),
+                                "url": page.url,
+                                "decision_trace": login_result.decision_trace,
+                                "updated_at": now_iso(),
+                            }
+                        )
+                        if login_result.ok:
+                            await self._persist_storage_state_async(global_manager.browser_context)
+                            await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+                            await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
+                            retry_reason = detect_non_product_page(
+                                page.url, await page.title(), await page.inner_text("body")
+                            )
+                            if not retry_reason:
+                                recovered = True
+                            else:
+                                initial_reason = retry_reason
+                    if not recovered:
+                        raise RuntimeError(
+                            f"taobao item page blocked: {initial_reason}. "
+                            f"Please ensure you are logged in and complete QR verification."
+                        )
+
+                # Scroll down to load all content
+                scroll_rounds = max(4, 4 + (self.manual_wait_seconds // 4))
+                for _ in range(scroll_rounds):
+                    await page.mouse.wheel(0, 1800)
+                    await page.wait_for_timeout(1200)
+
+                # Take full page screenshot
+                _full_page_path = str(image_dir / "full_page.png")
+                for _shot_attempt in range(2):
+                    try:
+                        await page.screenshot(path=_full_page_path, full_page=True)
+                        break
+                    except Exception as _shot_exc:
+                        if _shot_attempt == 0:
+                            LOG.warning(
+                                "full_page screenshot failed for item %s (attempt 1), retrying: %s",
+                                item_id,
+                                _shot_exc,
+                            )
+                            await page.wait_for_timeout(1500)
                         else:
-                            initial_reason = retry_reason
-                if not recovered:
-                    raise RuntimeError(
-                        f"taobao item page blocked: {initial_reason}. "
-                        f"Please ensure you are logged in and complete QR verification."
+                            LOG.warning(
+                                "full_page screenshot failed for item %s (attempt 2), skipping screenshot: %s",
+                                item_id,
+                                _shot_exc,
+                            )
+
+                # Collect detail blocks (product description, images, etc.)
+                detail_blocks = await self._collect_detail_blocks_from_page(
+                    page, item_id=item_id, image_dir=image_dir
+                )
+
+                # Extract page content
+                current_url = page.url
+                html = await page.content()
+                body_text = await page.inner_text("body")
+                title = await page.title()
+
+                # Extract image metadata
+                image_meta = await page.eval_on_selector_all(
+                    "img",
+                    """
+                    nodes => nodes.map(n => {
+                      const rect = n.getBoundingClientRect();
+                      return {
+                        src: (n.currentSrc || n.src || '').trim(),
+                        alt: (n.alt || '').trim(),
+                        class_name: String(n.className || ''),
+                        width: Number(n.naturalWidth || n.width || rect.width || 0),
+                        height: Number(n.naturalHeight || n.height || rect.height || 0)
+                      };
+                    }).filter(v => v.src)
+                    """,
+                )
+                image_urls = [
+                    str(v.get("src", "")) for v in image_meta if isinstance(v, dict)
+                ]
+
+                # Final check for blocked page
+                blocked_reason = detect_non_product_page(current_url, title, body_text)
+                if blocked_reason:
+                    raise RuntimeError(blocked_reason)
+
+                # Persist storage state (cookies, local storage)
+                await self._persist_storage_state_async(global_manager.browser_context)
+
+                # Build and return ItemDetail from raw data
+                return self._build_item_detail_from_raw(
+                    item_id=item_id,
+                    crawl_time=crawl_time,
+                    title=title,
+                    html=html,
+                    body_text=body_text,
+                    image_meta=image_meta,
+                    image_urls=image_urls,
+                    detail_blocks_override=detail_blocks or None,
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                can_retry = nav_attempt < max_nav_attempts and _is_retryable_navigation_error(error)
+                if can_retry:
+                    LOG.warning(
+                        "crawl_async_global retry for item %s (%s/%s): %s",
+                        item_id,
+                        nav_attempt,
+                        max_nav_attempts,
+                        error,
                     )
+                    await asyncio.sleep(min(1.5 * nav_attempt, 4.0))
+                    continue
+                LOG.error("crawl_async_global failed for item %s: %s", item_id, error)
+                return ItemDetail(
+                    item_id=item_id,
+                    title="",
+                    main_image_url="",
+                    shop_name="",
+                    brand="",
+                    prices=[],
+                    skus=[],
+                    detail_summary="",
+                    detail_text="",
+                    detail_blocks=[],
+                    citations=[],
+                    crawl_time=crawl_time,
+                    error=error,
+                )
+            finally:
+                if page is not None and not page.is_closed():
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
 
-            # Scroll down to load all content
-            scroll_rounds = max(4, 4 + (self.manual_wait_seconds // 4))
-            for _ in range(scroll_rounds):
-                await page.mouse.wheel(0, 1800)
-                await page.wait_for_timeout(1200)
-
-            # Take full page screenshot
-            _full_page_path = str(image_dir / "full_page.png")
-            for _shot_attempt in range(2):
-                try:
-                    await page.screenshot(path=_full_page_path, full_page=True)
-                    break
-                except Exception as _shot_exc:
-                    if _shot_attempt == 0:
-                        LOG.warning(
-                            "full_page screenshot failed for item %s (attempt 1), retrying: %s",
-                            item_id,
-                            _shot_exc,
-                        )
-                        await page.wait_for_timeout(1500)
-                    else:
-                        LOG.warning(
-                            "full_page screenshot failed for item %s (attempt 2), skipping screenshot: %s",
-                            item_id,
-                            _shot_exc,
-                        )
-
-            # Collect detail blocks (product description, images, etc.)
-            detail_blocks = await self._collect_detail_blocks_from_page(
-                page, item_id=item_id, image_dir=image_dir
-            )
-
-            # Extract page content
-            current_url = page.url
-            html = await page.content()
-            body_text = await page.inner_text("body")
-            title = await page.title()
-
-            # Extract image metadata
-            image_meta = await page.eval_on_selector_all(
-                "img",
-                """
-                nodes => nodes.map(n => {
-                  const rect = n.getBoundingClientRect();
-                  return {
-                    src: (n.currentSrc || n.src || '').trim(),
-                    alt: (n.alt || '').trim(),
-                    class_name: String(n.className || ''),
-                    width: Number(n.naturalWidth || n.width || rect.width || 0),
-                    height: Number(n.naturalHeight || n.height || rect.height || 0)
-                  };
-                }).filter(v => v.src)
-                """,
-            )
-            image_urls = [
-                str(v.get("src", "")) for v in image_meta if isinstance(v, dict)
-            ]
-
-            # Final check for blocked page
-            blocked_reason = detect_non_product_page(current_url, title, body_text)
-            if blocked_reason:
-                raise RuntimeError(blocked_reason)
-
-            # Persist storage state (cookies, local storage)
-            await self._persist_storage_state_async(global_manager.browser_context)
-
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            LOG.error("crawl_async_global failed for item %s: %s", item_id, error)
-            return ItemDetail(
-                item_id=item_id,
-                title="",
-                main_image_url="",
-                shop_name="",
-                brand="",
-                prices=[],
-                skus=[],
-                detail_summary="",
-                detail_text="",
-                detail_blocks=[],
-                citations=[],
-                crawl_time=crawl_time,
-                error=error,
-            )
-
-        # Build and return ItemDetail from raw data
-        return self._build_item_detail_from_raw(
+        return ItemDetail(
             item_id=item_id,
+            title="",
+            main_image_url="",
+            shop_name="",
+            brand="",
+            prices=[],
+            skus=[],
+            detail_summary="",
+            detail_text="",
+            detail_blocks=[],
+            citations=[],
             crawl_time=crawl_time,
-            title=title,
-            html=html,
-            body_text=body_text,
-            image_meta=image_meta,
-            image_urls=image_urls,
-            detail_blocks_override=detail_blocks or None,
+            error="RuntimeError: crawl_async_global exhausted retries",
         )

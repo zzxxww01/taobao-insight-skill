@@ -6,6 +6,7 @@ import csv
 import datetime as dt
 import io
 import json
+import os
 import re
 import shutil
 import time
@@ -1087,6 +1088,29 @@ class TaskTracker:
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
 
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _task_idle_minutes(task: dict[str, Any]) -> float:
+        updated_at = str(task.get("updated_at", "")).strip()
+        if not updated_at:
+            return 0.0
+        try:
+            updated_dt = dt.datetime.fromisoformat(updated_at)
+        except Exception:
+            return 0.0
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        delta = now - updated_dt
+        return max(0.0, delta.total_seconds() / 60.0)
+
     def create(self, workbook_id: str, keyword: str, total_items: int) -> str:
         tasks = self.storage.list_tasks()
         task_id = "task_" + uuid.uuid4().hex[:12]
@@ -1098,6 +1122,7 @@ class TaskTracker:
             "finished_items": 0,
             "status": "running",
             "failures": [],
+            "owner_pid": os.getpid(),
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
@@ -1130,6 +1155,52 @@ class TaskTracker:
         tasks[task_id]["result"] = result
         tasks[task_id]["updated_at"] = now_iso()
         self.storage.save_tasks(tasks)
+
+    def recover_orphaned_running(
+        self, stale_after_minutes: int = 60
+    ) -> list[str]:
+        tasks = self.storage.list_tasks()
+        changed: list[str] = []
+        for task_id, task in tasks.items():
+            if not isinstance(task, dict):
+                continue
+            if str(task.get("status", "")).strip().lower() != "running":
+                continue
+
+            owner_pid = int(task.get("owner_pid", 0) or 0)
+            owner_alive = self._pid_alive(owner_pid) if owner_pid else False
+            idle_minutes = self._task_idle_minutes(task)
+
+            orphaned = False
+            if owner_pid and not owner_alive:
+                orphaned = True
+            elif not owner_pid and idle_minutes >= max(1, int(stale_after_minutes)):
+                orphaned = True
+
+            if not orphaned:
+                continue
+
+            reason = (
+                "Recovered orphaned running task: "
+                f"owner_pid={owner_pid or 'unknown'}, owner_alive={owner_alive}, "
+                f"idle_minutes={round(idle_minutes, 2)}"
+            )
+            failures = task.get("failures", [])
+            if not isinstance(failures, list):
+                failures = []
+            failures.append({"item_id": "__task__", "reason": clean_text(reason, 400)})
+            task["failures"] = failures
+            task["status"] = "failed"
+            task["result"] = {
+                "error": clean_text(reason, 400),
+                "recovered_orphan": True,
+            }
+            task["updated_at"] = now_iso()
+            changed.append(task_id)
+
+        if changed:
+            self.storage.save_tasks(tasks)
+        return changed
 
     def get(self, task_id: str) -> dict[str, Any]:
         tasks = self.storage.list_tasks()
