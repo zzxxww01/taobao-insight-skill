@@ -1,217 +1,148 @@
 ---
 name: taobao-insight
-description: Taobao/Tmall keyword product research and competitor analysis. Use when user asks for 淘宝/天猫商品调研、关键词选品、竞品分析、抓取N条商品、卖点提炼、导出CSV或HTML报告（例如：淘宝狗粮关键词调研20条）。
+description: Taobao/Tmall keyword product research and competitor analysis. Use when user asks for 淘宝/天猫商品调研、关键词选品、竞品分析、抓取N条商品、导出MD或HTML报告（例如：淘宝狗粮关键词调研20条）。
 ---
 
-# 淘宝市场调研 (Taobao Market Research)
+# 淘宝市场调研
 
-> **前置说明**: 本系统采用双引擎驱动：底层 Playwright 自动化抓取，上层大模型总结卖点。请严格遵守以下 5 个**循序渐进的执行阶段**，切勿跳过检查步骤擅自运行爬虫。
->
-> **重要**: Windows 系统下执行命令时需要设置 UTF-8 编码环境，否则会出现编码错误。所有 Python 命令前需要设置 `PYTHONIOENCODING=utf-8`。
+原生 CDP 自动化抓取 + 大模型卖点提炼。按以下 5 阶段顺序执行，不要跳步。
 
-## 工作流程
+> Windows 下所有 Python 命令前必须设置 `PYTHONIOENCODING=utf-8`。
 
-你将按照以下 5 个阶段执行淘宝市场调研任务：
+---
 
-### 阶段 1: 运行环境检查
+## 阶段 1: 环境检查
 
-**目标**: 确保用户的环境健全且依赖已安装。
-
-你必须在你被唤起的**第一句话**执行这个诊断（注意设置 UTF-8 编码）：
-```bash
-# Windows CMD
-set PYTHONIOENCODING=utf-8 && python scripts/check_env.py
-
-# PowerShell
+**被唤起后第一件事**就运行：
+```powershell
 $env:PYTHONIOENCODING="utf-8"; python scripts/check_env.py
 ```
 
-**如果环境检测失败**：
-- 检查是否缺少 Playwright 或其他依赖
-- 检查 `.env` 文件中的 `GEMINI_API_KEY` 是否配置
-- 根据错误提示安装缺失的依赖
+失败时检查：`.env` 中 `GEMINI_API_KEY` 是否配置、`websockets`/`httpx` 等依赖是否安装。
 
-**注意**: 本系统使用 GlobalBrowserManager 自动管理浏览器，**不需要**用户手动启动 Chrome CDP 端口。浏览器会在执行时自动启动。
+浏览器**自动管理**——不需要用户手动启动 Chrome 或配置 CDP 端口。
 
 ---
 
-### 阶段 2: 任务意图解析与参数补齐
+## 阶段 2: 解析意图
 
-**目标**: 确认用户想要调研的`目标商品词`和`抓取梳理数量`（默认 Top 30）。
+从用户指令中提取两个参数：
+- `keyword`: 目标商品词
+- `top_n`: 抓取数量（默认 30）
 
-1. 如果用户指令明确说了"调研排名前20的猫粮"，则记录: `keyword=猫粮`, `top_n=20`。
-2. 如果用户只说"跑一下防晒霜市场"，则默认追问或提示："我将抓取前 30 名的销售爆款并输出。准备开跑了。"
+示例："调研排名前 20 的猫粮" → `keyword=猫粮, top_n=20`
+
+如果用户没指定数量，告知："我将抓取前 30 名销售爆款并输出。"
 
 ---
 
-### 阶段 3: 执行提取引擎并告知"扫码可能"
+## 阶段 3: 执行抓取
 
-**目标**: 启动 `pipeline.py` 进行数据获取并告知用户人工介入点。
+**运行前必须告知用户**：
+> 爬虫即将开始，浏览器将自动启动。如果跳转到登录页面，程序会自动暂停等待您扫码，登录后自动继续。
 
-由于淘宝风控原因，在调用爬虫之前，你**必须**向用户输出这段预警信息：
-> 💡 爬虫即将开始，浏览器将自动启动...
-> *重要提示：如果浏览器跳转到淘宝登录页面，程序会自动暂停并等待您扫码登录。登录完成后程序会自动继续执行。*
-
-**登录流程说明**：
-- **首次运行**：会在搜索阶段自动检测登录页面，自动弹出浏览器窗口并等待扫码登录（最多 300 秒）
-- **后续运行**：cookies 会自动保存，**不需要**重新登录
-- 登录成功后程序会自动继续，**不需要**手动操作
-- 扫码等待期间程序会进入**冻结模式**（不执行后台刷新/跳转），避免干扰扫码与登录回跳
-- 若扫码成功但页面未自动跳转，程序会依据登录 cookie 判定成功并主动跳回目标搜索页
-- 若搜索阶段误入商品页，程序会自动回跳到搜索页继续抓取
-- 若抓取阶段会话过期跳到登录页，程序会明确标记为 session 失效并终止该商品抓取
-- 程序结束时会自动保存登录状态到用户配置目录
-
-**Cookies 保存位置**：
-- Windows: `%APPDATA%\taobao_insight_profile`
-- macOS: `~/Library/Application Support/taobao_insight_profile`
-- Linux: `~/.config/taobao_insight_profile`
-
-执行入口命令（**注意设置 UTF-8 编码**）：
-```bash
-# PowerShell 执行��式
+**执行命令**（PowerShell）：
+```powershell
 cd skills/taobao-insight
 $env:PYTHONIOENCODING="utf-8"
-$env:TAOBAO_BROWSER_MODE="persistent"
 $env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\taobao_insight_profile"
 $env:TAOBAO_STORAGE_STATE_FILE="skills\\taobao-insight\\data\\taobao_storage_state.json"
-python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 --taobao-browser-mode persistent final-csv "<用户提供的 keyword>" --top-n <用户指定的数字> --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
+python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<keyword>" --top-n <top_n> --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
 ```
 
-**关键参数说明**：
-- `--taobao-browser-mode persistent`: 使用持久化浏览器模式（**自动启动浏览器**，不需要手动启动 CDP）
-- 浏览器管理器默认启用（无需单独参数）。
-- `--crawl-workers 1`: 使用单一事件循环（重要：避免 Playwright 连接问题）
-- `--llm-workers 64`: LLM 并发数（Flash 模型默认 64，Pro 模型建议 16）
-- 搜索路径固定为统一浏览器链路（无需单独参数）。
-- `--top-n N`: 抓取前 N 个商品
+**参数速查**：
+| 参数 | 说明 |
+|---|---|
+| `--crawl-workers 1` | 必须为 1，避免并发连接问题 |
+| `--llm-workers 64` | Flash 模型 64，Pro 模型改为 16 |
+| `--top-n N` | 抓取前 N 个商品 |
+| `--taobao-browser-mode` | 默认 `cdp`（自动降级 persistent），一般不用指定 |
+| `--playwright-cdp-url` | 可选，连接已有浏览器实例 |
+| `--item-urls-file` | 可选，传入已有 URL 列表跳过搜索阶段 |
 
-#### 性能优化（2026-02-28）
+**登录行为**：
+- 首次运行弹出浏览器等待扫码（最多 300 秒），后续运行自动复用 cookies
+- 扫码期间程序冻结等待，登录后自动继续
+- 终端出现 `login page content detected` 是正常的扫码等待日志，不要重试
 
-系统已启用**流水线并行**优化：
-- 爬虫和 LLM 处理**重叠执行**：当爬虫完成第 N 个商品时，立即开始 LLM 处理，无需等待所有爬虫完成
-- LLM 并发：Flash/Vision 模型 64 并发，Pro/Preview 模型 16 并发
-- 预期效果：30 条商品处理时间从 ~45 分钟优化至 ~10-15 分钟
-
-#### 登录态持久化要求（避免重复扫码）
-
-- 必须固定 `TAOBAO_USER_DATA_DIR` 到稳定目录（建议 `%APPDATA%\\taobao_insight_profile`）。
-- 必须固定 `TAOBAO_STORAGE_STATE_FILE` 到稳定文件（建议 skill 的 `data/taobao_storage_state.json`）。
-- 登录成功后立即保存 storage_state，不要等任务结束再保存。
-
-#### 扫码登录问题复盘（2026-02-27）
-
-1. **现象：扫码很多次没有反应**
-   - 根因：任务进程未真正执行（命令被中断、权限被拦截，或进程已提前退出）。
-   - 正确做法：确认终端日志持续输出且任务未退出后再扫码。
-2. **现象：环境检查提示“必须开启 9222”**
-   - 根因：把 CDP 模式的前提误用到了 persistent 模式。
-   - 正确做法：`persistent` 模式无需手动开启 9222；仅 `cdp` 模式才需要。
-3. **现象：扫码后进入商品页，而不是搜索页**
-   - 根因：浏览器复用页或登录回跳导致页面上下文漂移。
-   - 正确做法：搜索阶段必须识别“误入商品页”并强制回到目标搜索 URL（已内置）。
-4. **现象：运行过程中突然变成登录页**
-   - 根因：cookie 失效、风控二次校验或会话被刷新。
-   - 正确做法：搜索阶段触发登录等待并恢复；抓取阶段识别为会话失效并给出明确错误。
-
-#### 页面状态识别规则（必须遵守）
-
-- **搜索阶段**：当前页应为 `s.taobao.com/search` 或 `list.tmall.com/search_product.htm`。
-- **若识别到商品详情页 URL**（`detail.tmall.com/item.htm` 或 `item.taobao.com/item.htm`）：立即导航回目标搜索 URL。
-- **若识别到登录/验证码页**（URL 或页面内容命中登录特征）：触发扫码等待流程。
-- **恢复后复检**：必须再次确认处于搜索页；否则直接报错并提示用户重跑。
-- **登录判定优先级**：Cookie 信号优先于页面跳转；当出现“扫码成功但不跳转”时按 cookie 驱动恢复。
+**环境变量持久化**（避免重复扫码）：
+- 必须固定 `TAOBAO_USER_DATA_DIR`（建议 `%APPDATA%\taobao_insight_profile`）
+- 必须固定 `TAOBAO_STORAGE_STATE_FILE`（建议 `data/taobao_storage_state.json`）
 
 ---
 
-### 阶段 4: 监控异步产出并跟踪状态
+## 阶段 4: 监控进度
 
-**目标**: 长耗时的爬虫应当向用户透明进展。
-
-因为 Gemini 序列分析多个商品和提取详情需要可能数十秒甚至两分钟。你可以使用后台监控或者在提取途中穿插状态汇报。
-例如，如果读取到 `[INFO]` 或看到浏览器正在操作，可以告诉用户：
-`"正在利用大模型（Gemini）分析商品列表与提炼卖点文档，请稍候..."`
-
-*(若终端打印 `detect_non_product_page: login page content detected` 时，不用惊慌也不用重试，这就是用户正在进行合法扫码，静待即可。)*
-*(若终端提示 `search phase is still on item detail page after recovery`，说明页面上下文未恢复成功，需要重新运行并确保浏览器停留在搜索页。)*
+任务耗时较长时向用户汇报进展：
+- 看到 `[INFO]` 日志 → "正在利用 Gemini 分析商品列表与提炼卖点，请稍候..."
+- 看到 `login page content detected` → 正常扫码等待，静待即可
+- 看到 `search phase is still on item detail page after recovery` → 页面未恢复，需重新运行
 
 ---
 
-### 阶段 5: 分析出炉与物料清点
+## 阶段 5: 产出报告
 
-**目标**: 向用户提供成果报告路径及汇总概览结论。
+当 `pipeline.py` 退出码为 `0` 时：
 
-所有的数据都会保存在工作区的 `data/exports/` 目录中。当 `pipeline.py` 退出值为 `0` 时，整理输出：
+1. 确认两个文件已生成：`data/exports/<keyword>-top<top_n>.html` 和 `.md`
+2. **不要**额外创建任何临时导出文件
+3. 读取 HTML 或 MD 中关键结论，挑 1-2 个亮点给用户预览
+4. **必须**读取 `data/exports/<workbook_name>-run-summary.md`，从中提取以下字段向用户报告：
+   - `total_runtime_sec` — 总耗时
+   - `timings_sec` 下的 `search`、`crawl`、`llm_extract`、`llm_analyze`、`export` — 各阶段耗时
+   - `success_rate`、`total_items`、`success_items`、`failed_items` — 成功率与样本统计
+   - `top_errors` — 关键错误列表（每条含 `reason` 和 `count`）
+   - `key_conclusion` — 关键结论
+5. **必须**读取 `data/run_logs/<task_id>.jsonl`，若有失败需指出集中在哪个阶段
+6. 若运行中出现兜底/降级行为（如 CDP 降级到 persistent、LLM 重试、页面恢复等），也需在报告中提及
 
-1. 按执行命令中指定的路径确认两个目标文件已生成：`data/exports/<keyword>-top<top_n>.html` 与 `data/exports/<keyword>-top<top_n>.md`
-2. 不要额外创建任何临时导出文件（例如 `*-products.*` 或其它额外副本）
-3. （重要）读取刚刚生成的 HTML 或 MD 中的关键结论，挑选其中最震撼的 1-2 点给用户高能预览！
-4. （必须）读取本次自动生成的运行总结文件：`data/exports/<workbook_name>-run-summary.md`，向用户报告：
-   - 总耗时（`total_runtime_sec`）
-   - 各阶段耗时（search/crawl/llm_extract/llm_analyze/export）
-   - 成功率（success_rate）
-   - 关键错误 TopN（如 `Page.goto ERR_ABORTED`）
-   - 关键结论（key_conclusion）
-5. （必须）读取关键步骤日志文件：`data/run_logs/<task_id>.jsonl`，若失败需指出失败集中在哪个阶段（search/crawl/llm_extract/llm_analyze/export）。
-
-例如向用户展示：
+**输出示例**：
 ```
-✨ 淘宝大盘深度调研完成！
+淘宝大盘深度调研完成！
 
-📊 仪表盘: skills/taobao-insight/data/exports/<商品名>-top<N>-<timestamp>.html
-📝 Markdown: skills/taobao-insight/data/exports/<商品名>-top<N>-<timestamp>.md
+仪表盘: skills/taobao-insight/data/exports/<keyword>-top<N>.html
+Markdown: skills/taobao-insight/data/exports/<keyword>-top<N>.md
 
-📝 市场缩影：
-- 样本量：5 个商品
-- 已提取卖点：3 个
-- 有价格信息：5 个
+市场缩影：
+- 样本量：20 个商品（成功 18 / 失败 2）
+- 成功率：90.0%
 - 市场标签：粉饼、定妆、持久
 
-🧪 运行摘要：
-- 总耗时：207.629s
-- 成功率：100%
-- 关键错误：无
-- 关键结论：<从 run-summary.md 提取>
+各阶段耗时：
+- 搜索(search)：12.3s
+- 抓取(crawl)：89.4s
+- LLM 提取(llm_extract)：45.2s
+- LLM 分析(llm_analyze)：38.7s
+- 导出(export)：2.1s
+- 总耗时：207.6s
+
+错误与异常：
+- Page.goto net::ERR_ABORTED（2 次）
+- Gemini API timeout（1 次）
+（若无错误则输出"无"）
+
+兜底/降级事件：
+- CDP 初始化失败，已自动降级到 persistent 模式
+（若无降级事件则省略此段）
+
+关键结论：<从 run-summary.md 的 key_conclusion 字段提取>
 ```
 
 ---
 
-## 错误处理边界法则
+## 错误处理
 
-1. **环境检测挂了**: 检查 Python 依赖和 .env 配置
-2. **浏览器启动失败**: 检查是否有其他浏览器进程占用，关闭所有 Chrome 进程后重试
-3. **`PermissionError: [WinError 5] 拒绝访问`（Playwright 启动阶段）**: 表示运行环境权限不足（常见于受限沙箱），需在可启动浏览器的环境执行
-4. **`RuntimeError: Search failed: login page content detected`**: 说明用户没能在 300 秒内完成手机扫码认证。提示用户：”300秒超时，登录未成功。请重新运行，程序会再次提示登录。”
-5. **`RuntimeError: taobao item page blocked: redirected to Taobao login page`**: 说明抓取阶段登录态失效；应重新跑流程并在搜索阶段完成扫码
-6. **`Exception: Gemini API ...`**: 大概率被封IP或触发网络限速，检查 `.env` 配置的 Proxy 或者重启网络
-7. **编码错误**: 确保设置了 `PYTHONIOENCODING=utf-8`
-8. **”浏览器显示登录成功但程序仍超时”**: 多数是页面仍被判定为登录态（未回到搜索页）。需要自动复检搜索结果页并在登录成功后立即落盘 cookie
-
-记住：本技能的超凡之处在于 **跨越极高反爬壁垒拿到底层网页** 且 **内化了大模型卖点萃取逻辑**，用清晰的流水线汇报进展并保证终端产出物的可用与可读。
-
----
-
-## Stability Baseline (Validated 2026-03-01)
-
-Use this flow when you need maximum reproducibility and want to push sample success rate to 100%.
-
-1. Keep `--taobao-browser-mode persistent` and `--crawl-workers 1`.
-2. Freeze the sample set first, then run analysis with input URLs:
-   - Step A (optional): get top-N URLs from search.
-   - Step B (recommended): run `final-csv` with `--item-urls-file <frozen_urls.txt>`.
-3. Always read both artifacts after each run:
-   - `data/exports/<workbook>-run-summary.md`
-   - `data/run_logs/<task_id>.jsonl`
-4. Treat these as blocking errors and rerun after fix:
-   - `Browser not initialized`
-   - `launch_persistent_context ... TargetClosedError`
-   - repeated `Page.goto net::ERR_ABORTED`
-
-Reference command (PowerShell):
-
-```powershell
-$env:PYTHONIOENCODING="utf-8"
-$env:TAOBAO_BROWSER_MODE="persistent"
-$env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\taobao_insight_profile"
-python scripts/pipeline.py --crawl-workers 1 --llm-workers 16 --taobao-browser-mode persistent final-csv "口红" --top-n 10 --item-urls-file "data/exports/kouhong-top10-urls.txt" --output "data/exports/taobao-kouhong-top10.md" --html-output "data/exports/taobao-kouhong-top10.html"
-```
+| 错误信息 | 处理方式 |
+|---|---|
+| 环境检测失败 | 检查 Python 依赖和 `.env` 配置 |
+| 浏览器启动失败 | 关闭所有 Chrome 进程后重试 |
+| `Chrome/Edge executable not found` | 设置 `CUSTOM_BROWSER_PATH` 环境变量 |
+| `CDP init failed, fallback to persistent` | 非阻塞提示，已自动降级 |
+| `PermissionError: [WinError 5]` | 权限不足，需在可启动浏览器的环境执行 |
+| `Search failed: login page content detected` | 300 秒扫码超时，提示用户重新运行 |
+| `taobao item page blocked: redirected to login` | 抓取阶段登录失效，重跑流程 |
+| `Exception: Gemini API ...` | 检查 `.env` 的 Proxy 配置或重启网络 |
+| 编码错误 | 确保设置了 `PYTHONIOENCODING=utf-8` |
+| 浏览器登录成功但程序超时 | 页面仍被判定为登录态，需复检搜索页并落盘 cookie |
+| `Browser not initialized` | 阻塞错误，重新运行 |
+| 反复 `Page.goto net::ERR_ABORTED` | 阻塞错误，重新运行 |
