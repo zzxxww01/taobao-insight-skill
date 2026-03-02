@@ -3,9 +3,21 @@
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 
 LOG = logging.getLogger("taobao_insight")
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = SCRIPT_DIR.parent
+if str(PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(PARENT_DIR))
+
+try:
+    from tools.login_rules import LOGIN_COOKIE_NAMES
+except Exception:
+    # Fallback for minimal environments where tools module is unavailable.
+    LOGIN_COOKIE_NAMES = {"cookie2", "unb", "_tb_token_", "_m_h5_tk"}
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -54,7 +66,6 @@ MAX_TOP_N = 100
 DEFAULT_GROUP_CODE = "1"
 DEFAULT_GROUP_NAME = "default-group"
 TAOBAO_DOMAINS = ("taobao.com", "tmall.com")
-LOGIN_COOKIE_NAMES = {"cookie2", "unb", "_tb_token_", "_m_h5_tk"}
 
 ITEM_URL_RE = re.compile(
     r"https?://(?:item\.taobao\.com|detail\.tmall\.com)/item\.htm\?[^\"'\s<>]+",
@@ -127,8 +138,8 @@ BRAND_PRODUCT_KEYWORD_RE = re.compile(
 )
 SEARCH_BLOCK_HINT = (
     "Taobao search was blocked by anti-bot or login validation. "
-    "Recommended: use browser-use with a signed-in real browser, or run with "
-    "--playwright-cdp-url http://127.0.0.1:9222 on a signed-in Chrome session, "
+    "Recommended: run in default raw-CDP mode with a signed-in real browser profile "
+    "(optionally set --playwright-cdp-url to attach an existing session), "
     "or pass direct item URLs by --item-url / --item-urls-file."
 )
 ANTI_BOT_MARKERS = [

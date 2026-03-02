@@ -1,4 +1,4 @@
-﻿"""Pipeline orchestration and CLI definition."""
+"""Pipeline orchestration and CLI definition."""
 
 from __future__ import annotations
 
@@ -45,8 +45,8 @@ from data import (
 from scraper import (
     Crawler,
     SearchClient,
+    list_cdp_pages,
     load_url_lines,
-    resolve_browser_use_cmd,
 )
 from analysis import (
     Analyzer,
@@ -811,7 +811,6 @@ class Pipeline:
         keyword: str,
         top_n: int,
         workbook_name: str | None,
-        search_backend: str,
         search_url: str | None,
         search_sort: str,
         shop_filter_enabled: bool,
@@ -1228,7 +1227,6 @@ class Pipeline:
         keyword: str,
         top_n: int,
         workbook_name: str | None,
-        search_backend: str,
         search_url: str | None,
         search_sort: str,
         shop_filter_enabled: bool,
@@ -1279,7 +1277,6 @@ class Pipeline:
             search_records = self.search_client.search_top_items(
                 keyword=keyword,
                 top_n=top_n,
-                backend=search_backend,
                 search_url=search_url,
                 search_sort=search_sort,
                 official_only=shop_filter_enabled,
@@ -1803,8 +1800,6 @@ def _default_storage_state_file() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     manual_wait_default = 0
-    cdp_context_default = 0
-    cdp_connect_timeout_default = 60_000
     manual_login_timeout_default = 300
     gemini_timeout_default = 45
     gemini_pro_retries_default = 2
@@ -1816,18 +1811,6 @@ def build_parser() -> argparse.ArgumentParser:
         manual_wait_default = max(0, int(os.getenv("MANUAL_WAIT_SECONDS", "0")))
     except ValueError:
         manual_wait_default = 0
-    try:
-        cdp_context_default = max(
-            0, int(os.getenv("PLAYWRIGHT_CDP_CONTEXT_INDEX", "0"))
-        )
-    except ValueError:
-        cdp_context_default = 0
-    try:
-        cdp_connect_timeout_default = max(
-            10_000, int(os.getenv("TAOBAO_CDP_CONNECT_TIMEOUT_MS", "60000"))
-        )
-    except ValueError:
-        cdp_connect_timeout_default = 60_000
     try:
         manual_login_timeout_default = max(
             30, int(os.getenv("TAOBAO_MANUAL_LOGIN_TIMEOUT_SEC", "300"))
@@ -1883,17 +1866,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persistent browser profile directory",
     )
     parser.add_argument(
-        "--taobao-manual-login-on-demand",
-        default=os.getenv("TAOBAO_MANUAL_LOGIN_ON_DEMAND", "0"),
-        choices=["0", "1"],
-    )
-    parser.add_argument(
         "--taobao-manual-login-timeout-sec",
         type=int,
         default=manual_login_timeout_default,
-    )
-    parser.add_argument(
-        "--taobao-cdp-connect-timeout-ms", type=int, default=cdp_connect_timeout_default
     )
     parser.add_argument(
         "--playwright-headless",
@@ -1901,35 +1876,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["0", "1"],
     )
     parser.add_argument(
-        "--browser-use-cmd", default=os.getenv("BROWSER_USE_CMD", "browser-use")
-    )
-    parser.add_argument(
-        "--prefer-cdp", default=os.getenv("PREFER_CDP", "1"), choices=["0", "1"]
-    )
-    parser.add_argument(
-        "--allow-http-fallback",
-        default=os.getenv("ALLOW_HTTP_FALLBACK", "0"),
-        choices=["0", "1"],
-    )
-    parser.add_argument(
-        "--allow-mirror-source",
-        default=os.getenv("ALLOW_MIRROR_SOURCE", "0"),
-        choices=["0", "1"],
-    )
-    parser.add_argument(
-        "--use-global-browser",
-        default=os.getenv("USE_GLOBAL_BROWSER", "1"),
-        choices=["0", "1"],
-        help="Use global browser manager (single-instance mode) for better stability",
-    )
-    parser.add_argument(
-        "--http-fallback-list-url", default=os.getenv("HTTP_FALLBACK_LIST_URL", "")
-    )
-    parser.add_argument(
         "--playwright-cdp-url",
         default=os.getenv(
             "PLAYWRIGHT_CDP_URL",
-            os.getenv("TAOBAO_CDP_ENDPOINT", "http://127.0.0.1:9222"),
+            os.getenv("TAOBAO_CDP_ENDPOINT", ""),
         ),
         help="Optional CDP endpoint of an existing browser session, e.g. http://127.0.0.1:9222",
     )
@@ -1938,17 +1888,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=manual_wait_default,
         help="Pause after page load to allow manual login/captcha solve before extraction",
-    )
-    parser.add_argument(
-        "--cdp-context-index",
-        type=int,
-        default=cdp_context_default,
-        help="When using CDP, choose browser context index (for multi-window/profile sessions)",
-    )
-    parser.add_argument(
-        "--cdp-page-url-contains",
-        default=os.getenv("PLAYWRIGHT_CDP_PAGE_URL_CONTAINS", ""),
-        help="When using CDP, reuse an existing page whose URL contains this text",
     )
     parser.add_argument(
         "--gemini-flash-model",
@@ -2005,9 +1944,6 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("keyword")
     analyze.add_argument("--top-n", type=int, default=5)
     analyze.add_argument(
-        "--search-backend", choices=["browser-use", "playwright"], default="browser-use"
-    )
-    analyze.add_argument(
         "--search-url", default="", help="Optional Taobao search URL to open directly"
     )
     analyze.add_argument(
@@ -2045,9 +1981,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     final_csv.add_argument("keyword")
     final_csv.add_argument("--top-n", type=int, default=5)
-    final_csv.add_argument(
-        "--search-backend", choices=["browser-use", "playwright"], default="browser-use"
-    )
     final_csv.add_argument(
         "--search-url", default="", help="Optional Taobao search URL to open directly"
     )
@@ -2167,9 +2100,6 @@ def setup_services(
     workbook_service = WorkbookService(storage)
     group_service = GroupService(storage)
     url_service = URLService(storage, workbook_service, group_service)
-    browser_use_cmd = resolve_browser_use_cmd(args.browser_use_cmd)
-    if browser_use_cmd != args.browser_use_cmd:
-        LOG.info("Resolved browser-use command: %s", browser_use_cmd)
     requested_headless = args.playwright_headless == "1"
     if requested_headless:
         LOG.warning(
@@ -2179,34 +2109,18 @@ def setup_services(
     browser_mode = str(args.taobao_browser_mode or "cdp").strip().lower()
     if browser_mode not in {"cdp", "persistent"}:
         browser_mode = "cdp"
-    manual_login_on_demand = str(args.taobao_manual_login_on_demand).strip() == "1"
     storage_state_file = Path(
         args.taobao_storage_state_file or _default_storage_state_file()
     )
     user_data_dir = Path(args.taobao_user_data_dir or _default_user_data_dir())
-    prefer_cdp = str(args.prefer_cdp).strip() == "1"
-    allow_http_fallback = str(args.allow_http_fallback).strip() == "1"
-    allow_mirror_source = str(args.allow_mirror_source).strip() == "1"
-    # Enable global browser manager for single-instance mode
-    use_global_browser = str(args.use_global_browser).strip() == "1" if hasattr(args, 'use_global_browser') else True
     search_client = SearchClient(
-        browser_use_cmd=browser_use_cmd,
         headless=effective_headless,
         browser_mode=browser_mode,
         cdp_url=args.playwright_cdp_url or "",
         manual_wait_seconds=max(0, int(args.manual_wait_seconds)),
-        cdp_context_index=max(0, int(args.cdp_context_index)),
-        cdp_page_url_contains=args.cdp_page_url_contains or "",
-        cdp_connect_timeout_ms=max(10_000, int(args.taobao_cdp_connect_timeout_ms)),
         storage_state_file=storage_state_file,
         user_data_dir=user_data_dir,
-        manual_login_on_demand=manual_login_on_demand,
         manual_login_timeout_sec=max(30, int(args.taobao_manual_login_timeout_sec)),
-        prefer_cdp=prefer_cdp,
-        allow_http_fallback=allow_http_fallback,
-        http_fallback_list_url=args.http_fallback_list_url or "",
-        allow_mirror_source=allow_mirror_source,
-        use_global_browser=use_global_browser,
     )
     crawler = Crawler(
         storage=storage,
@@ -2214,16 +2128,9 @@ def setup_services(
         browser_mode=browser_mode,
         cdp_url=args.playwright_cdp_url or "",
         manual_wait_seconds=max(0, int(args.manual_wait_seconds)),
-        cdp_context_index=max(0, int(args.cdp_context_index)),
-        cdp_page_url_contains=args.cdp_page_url_contains or "",
-        cdp_connect_timeout_ms=max(10_000, int(args.taobao_cdp_connect_timeout_ms)),
         storage_state_file=storage_state_file,
         user_data_dir=user_data_dir,
-        manual_login_on_demand=manual_login_on_demand,
         manual_login_timeout_sec=max(30, int(args.taobao_manual_login_timeout_sec)),
-        prefer_cdp=prefer_cdp,
-        allow_http_fallback=allow_http_fallback,
-        use_global_browser=use_global_browser,
     )
     extractor = SellingPointExtractor(
         gemini_api_key=os.getenv("GEMINI_API_KEY"),
@@ -2283,7 +2190,6 @@ def main(argv: list[str] | None = None) -> int:
                 keyword=args.keyword,
                 top_n=max(1, min(args.top_n, MAX_TOP_N)),
                 workbook_name=args.workbook_name or None,
-                search_backend=args.search_backend,
                 search_url=args.search_url or None,
                 search_sort=args.search_sort,
                 shop_filter_enabled=shop_filter_enabled,

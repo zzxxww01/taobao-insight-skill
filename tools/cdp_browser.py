@@ -1,25 +1,625 @@
 # -*- coding: utf-8 -*-
-# Adapted for Taobao Market Research from MediaCrawler project
-# Original: https://github.com/NanmiCoder/MediaCrawler
+"""Raw CDP browser manager.
 
-import os
+This module replaces the previous Playwright-over-CDP implementation with a
+native DevTools Protocol implementation, following the same launch/connect
+pattern used by the baoyu skill browser flow:
+1) launch Chrome with --remote-debugging-port
+2) poll /json/version for webSocketDebuggerUrl
+3) connect over WebSocket and operate page targets via Target.attachToTarget
+"""
+
+from __future__ import annotations
+
 import asyncio
-import socket
-import httpx
-import signal
 import atexit
-from typing import Optional, Dict, Any
-from playwright.async_api import Browser, BrowserContext, Playwright
+import base64
+import json
+import os
+import platform
+import signal
+import socket
+import subprocess
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional
 
-from tools.browser_launcher import BrowserLauncher
+import httpx
+
 from tools import utils
 
 
+def _is_windows() -> bool:
+    return platform.system().lower().startswith("win")
+
+
+def _find_available_port(start_port: int = 9222, max_attempts: int = 200) -> int:
+    port = max(1024, int(start_port))
+    for _ in range(max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                port += 1
+    raise RuntimeError(f"Cannot allocate debug port from {start_port} after {max_attempts} attempts")
+
+
+def _find_chrome_executable(override_path: str = "") -> str:
+    override = (override_path or "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    candidates: list[str] = []
+    system = platform.system()
+    if system == "Windows":
+        candidates = [
+            os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%PROGRAMFILES%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Microsoft\Edge\Application\msedge.exe"),
+        ]
+    elif system == "Darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    else:
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+        ]
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise RuntimeError(
+        "Chrome/Edge executable not found. Set CUSTOM_BROWSER_PATH to a valid executable path."
+    )
+
+
+def _parse_http_debug_base(cdp_url: str, fallback_port: int = 9222) -> str:
+    value = (cdp_url or "").strip()
+    if not value:
+        return f"http://127.0.0.1:{fallback_port}"
+    if value.startswith("ws://") or value.startswith("wss://"):
+        raise ValueError("websocket endpoint does not have an HTTP debug base")
+    if not value.startswith(("http://", "https://")):
+        value = "http://" + value
+    lowered = value.lower()
+    if lowered.endswith("/json/version"):
+        return value[: -len("/json/version")]
+    if lowered.endswith("/json"):
+        return value[: -len("/json")]
+    if lowered.endswith("/json/list"):
+        return value[: -len("/json/list")]
+    return value.rstrip("/")
+
+
+async def _wait_ws_url_from_debug_port(port: int, timeout_sec: int = 30) -> str:
+    deadline = asyncio.get_running_loop().time() + max(5, int(timeout_sec))
+    last_error = ""
+    endpoint = f"http://127.0.0.1:{int(port)}/json/version"
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(endpoint, timeout=3.0)
+            if resp.status_code == 200:
+                payload = resp.json()
+                ws_url = str(payload.get("webSocketDebuggerUrl", "")).strip()
+                if ws_url:
+                    return ws_url
+                last_error = "missing webSocketDebuggerUrl"
+            else:
+                last_error = f"http {resp.status_code}"
+        except Exception as exc:  # pragma: no cover - network failures are runtime-specific
+            last_error = str(exc)
+        await asyncio.sleep(0.2)
+    raise RuntimeError(f"Chrome debug port not ready on {port}: {last_error}")
+
+
+async def _resolve_ws_url(cdp_url: str) -> str:
+    value = (cdp_url or "").strip()
+    if not value:
+        raise RuntimeError("empty cdp endpoint")
+    if value.startswith(("ws://", "wss://")):
+        return value
+    base = _parse_http_debug_base(value)
+    endpoint = base + "/json/version"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(endpoint, timeout=5.0)
+    if resp.status_code != 200:
+        raise RuntimeError(f"CDP endpoint is unavailable: {endpoint} -> HTTP {resp.status_code}")
+    payload = resp.json()
+    ws_url = str(payload.get("webSocketDebuggerUrl", "")).strip()
+    if not ws_url:
+        raise RuntimeError(f"CDP endpoint has no webSocketDebuggerUrl: {endpoint}")
+    return ws_url
+
+
+class CdpConnection:
+    """Browser-level CDP connection with session-aware command routing."""
+
+    def __init__(self, ws: Any, timeout_sec: float = 30.0):
+        self._ws = ws
+        self._timeout_sec = max(5.0, float(timeout_sec))
+        self._next_id = 0
+        self._pending: Dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._event_handlers: Dict[str, set[Callable[[dict[str, Any]], None]]] = {}
+        self._reader_task: Optional[asyncio.Task[None]] = None
+        self._closed = False
+
+    @classmethod
+    async def connect(cls, ws_url: str, timeout_sec: float = 30.0) -> "CdpConnection":
+        import websockets
+
+        ws = await websockets.connect(
+            ws_url,
+            open_timeout=max(5.0, float(timeout_sec)),
+            ping_interval=20,
+        )
+        conn = cls(ws=ws, timeout_sec=timeout_sec)
+        conn._reader_task = asyncio.create_task(conn._reader_loop())
+        return conn
+
+    async def _reader_loop(self) -> None:
+        try:
+            async for raw in self._ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                msg_id = msg.get("id")
+                if isinstance(msg_id, int):
+                    fut = self._pending.pop(msg_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(msg)
+                    continue
+                method = str(msg.get("method", "") or "")
+                if not method:
+                    continue
+                handlers = self._event_handlers.get(method, set())
+                if not handlers:
+                    continue
+                for handler in list(handlers):
+                    try:
+                        handler(msg)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        finally:
+            self._closed = True
+            pending = list(self._pending.values())
+            self._pending.clear()
+            for fut in pending:
+                if not fut.done():
+                    fut.set_exception(RuntimeError("CDP connection closed"))
+
+    async def send(
+        self,
+        method: str,
+        params: Optional[dict[str, Any]] = None,
+        *,
+        session_id: str = "",
+        timeout_sec: float = 15.0,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("CDP connection is closed")
+        self._next_id += 1
+        msg_id = self._next_id
+        payload: dict[str, Any] = {"id": msg_id, "method": method}
+        if params:
+            payload["params"] = params
+        if session_id:
+            payload["sessionId"] = session_id
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending[msg_id] = fut
+
+        await self._ws.send(json.dumps(payload, ensure_ascii=False))
+
+        try:
+            response = await asyncio.wait_for(
+                fut, timeout=max(1.0, float(timeout_sec))
+            )
+        except Exception:
+            self._pending.pop(msg_id, None)
+            raise
+
+        if "error" in response:
+            err = response.get("error")
+            raise RuntimeError(f"CDP {method} failed: {err}")
+        return dict(response.get("result", {}) or {})
+
+    def on(self, method: str, handler: Callable[[dict[str, Any]], None]) -> None:
+        handlers = self._event_handlers.setdefault(method, set())
+        handlers.add(handler)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._ws.close()
+        except Exception:
+            pass
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except Exception:
+                pass
+            self._reader_task = None
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(RuntimeError("CDP connection closed"))
+
+    @property
+    def is_connected(self) -> bool:
+        return not self._closed
+
+
+class _RawCdpMouse:
+    def __init__(self, page: "RawCdpPage"):
+        self._page = page
+
+    async def wheel(self, delta_x: int, delta_y: int) -> None:
+        _ = delta_x
+        await self._page.evaluate(f"window.scrollBy(0, {int(delta_y)}); true")
+
+
+class _RawCdpLocator:
+    def __init__(self, page: "RawCdpPage", selector: str):
+        self._page = page
+        self._selector = selector
+
+    @property
+    def first(self) -> "_RawCdpLocator":
+        return self
+
+    async def click(self, timeout: int = 1500) -> None:
+        _ = timeout
+        selector_json = json.dumps(self._selector, ensure_ascii=False)
+        ok = await self._page.evaluate(
+            f"""
+(() => {{
+  const node = document.querySelector({selector_json});
+  if (!node) return false;
+  node.scrollIntoView({{block: "center", inline: "center"}});
+  if (typeof node.click === "function") node.click();
+  return true;
+}})()
+"""
+        )
+        if not ok:
+            raise RuntimeError(f"locator click failed: {self._selector}")
+
+
+class RawCdpPage:
+    """Playwright-like page facade backed by raw CDP session."""
+
+    def __init__(
+        self,
+        manager: "CDPBrowserManager",
+        target_id: str,
+        session_id: str,
+    ):
+        self.manager = manager
+        self.conn = manager.connection
+        self.target_id = target_id
+        self.session_id = session_id
+        self._closed = False
+        self._last_url = ""
+        self.mouse = _RawCdpMouse(self)
+
+    async def initialize(self, user_agent: str = "") -> None:
+        await self.conn.send("Page.enable", session_id=self.session_id)
+        await self.conn.send("Runtime.enable", session_id=self.session_id)
+        await self.conn.send("DOM.enable", session_id=self.session_id)
+        await self.conn.send("Network.enable", session_id=self.session_id)
+        if user_agent:
+            await self.conn.send(
+                "Network.setUserAgentOverride",
+                {"userAgent": user_agent},
+                session_id=self.session_id,
+            )
+        if self.manager._stealth_script_source:
+            await self.conn.send(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": self.manager._stealth_script_source},
+                session_id=self.session_id,
+            )
+        await self._sync_url()
+
+    @property
+    def url(self) -> str:
+        return self._last_url
+
+    @property
+    def frames(self) -> list[Any]:
+        return []
+
+    @property
+    def main_frame(self) -> "RawCdpPage":
+        return self
+
+    def locator(self, selector: str) -> _RawCdpLocator:
+        return _RawCdpLocator(self, selector)
+
+    def on(self, event: str, callback: Callable[..., Any]) -> None:
+        # Raw CDP response-event wiring is intentionally omitted for now.
+        _ = event
+        _ = callback
+
+    async def _sync_url(self) -> None:
+        try:
+            value = await self.evaluate("location.href || ''")
+            self._last_url = str(value or "")
+        except Exception:
+            pass
+
+    async def evaluate(self, expression: str, return_by_value: bool = True) -> Any:
+        result = await self.conn.send(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": bool(return_by_value),
+                "awaitPromise": True,
+            },
+            session_id=self.session_id,
+        )
+        if isinstance(result.get("exceptionDetails"), dict):
+            raise RuntimeError(f"CDP evaluate exception: {result['exceptionDetails']}")
+        value = dict(result.get("result", {}) or {})
+        if return_by_value:
+            return value.get("value")
+        return value
+
+    async def eval_on_selector_all(self, selector: str, expression: str) -> Any:
+        selector_json = json.dumps(selector, ensure_ascii=False)
+        return await self.evaluate(
+            f"""
+(() => {{
+  const nodes = Array.from(document.querySelectorAll({selector_json}));
+  const mapper = {expression};
+  return mapper(nodes);
+}})()
+"""
+        )
+
+    async def goto(
+        self,
+        url: str,
+        wait_until: str = "domcontentloaded",
+        timeout: int = 120_000,
+    ) -> None:
+        _ = wait_until
+        await self.conn.send(
+            "Page.navigate",
+            {"url": str(url or "")},
+            session_id=self.session_id,
+            timeout_sec=max(10.0, float(timeout) / 1000.0),
+        )
+        await self._wait_document_ready(timeout_ms=int(timeout))
+        await self._sync_url()
+
+    async def _wait_document_ready(self, timeout_ms: int = 30_000) -> None:
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(timeout_ms) / 1000.0)
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                ready_state = await self.evaluate("document.readyState || ''")
+            except Exception:
+                ready_state = ""
+            if ready_state in {"interactive", "complete"}:
+                return
+            await asyncio.sleep(0.25)
+
+    async def title(self) -> str:
+        await self._sync_url()
+        value = await self.evaluate("document.title || ''")
+        return str(value or "")
+
+    async def inner_text(self, selector: str) -> str:
+        await self._sync_url()
+        selector_json = json.dumps(selector, ensure_ascii=False)
+        value = await self.evaluate(
+            f"""
+(() => {{
+  const node = document.querySelector({selector_json});
+  return node ? String(node.innerText || node.textContent || '') : '';
+}})()
+"""
+        )
+        return str(value or "")
+
+    async def content(self) -> str:
+        await self._sync_url()
+        value = await self.evaluate(
+            "document.documentElement ? document.documentElement.outerHTML : ''"
+        )
+        return str(value or "")
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        await asyncio.sleep(max(0.0, float(ms) / 1000.0))
+        await self._sync_url()
+
+    async def bring_to_front(self) -> None:
+        await self.conn.send("Page.bringToFront", session_id=self.session_id)
+        await self._sync_url()
+
+    async def screenshot(self, path: str, full_page: bool = False) -> None:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        if full_page:
+            metrics = await self.evaluate(
+                """
+(() => {
+  const body = document.body;
+  const html = document.documentElement;
+  const width = Math.max(
+    body ? body.scrollWidth : 0,
+    html ? html.scrollWidth : 0,
+    body ? body.offsetWidth : 0,
+    html ? html.offsetWidth : 0,
+    html ? html.clientWidth : 0
+  );
+  const height = Math.max(
+    body ? body.scrollHeight : 0,
+    html ? html.scrollHeight : 0,
+    body ? body.offsetHeight : 0,
+    html ? html.offsetHeight : 0,
+    html ? html.clientHeight : 0
+  );
+  return { width, height, dpr: window.devicePixelRatio || 1 };
+})()
+"""
+            )
+            width = int(max(1, min(8000, float((metrics or {}).get("width", 1440)))))
+            height = int(max(1, min(16000, float((metrics or {}).get("height", 2200)))))
+            dpr = float((metrics or {}).get("dpr", 1.0) or 1.0)
+            await self.conn.send(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "mobile": False,
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": max(1.0, dpr),
+                },
+                session_id=self.session_id,
+            )
+
+        try:
+            payload = await self.conn.send(
+                "Page.captureScreenshot",
+                {
+                    "format": "png",
+                    "fromSurface": True,
+                    "captureBeyondViewport": bool(full_page),
+                },
+                session_id=self.session_id,
+                timeout_sec=60.0,
+            )
+            data = str(payload.get("data", "") or "").strip()
+            if not data:
+                raise RuntimeError("empty screenshot payload")
+            output.write_bytes(base64.b64decode(data))
+        finally:
+            if full_page:
+                try:
+                    await self.conn.send(
+                        "Emulation.clearDeviceMetricsOverride",
+                        session_id=self.session_id,
+                    )
+                except Exception:
+                    pass
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.conn.send("Target.closeTarget", {"targetId": self.target_id})
+        except Exception:
+            pass
+
+    def is_closed(self) -> bool:
+        return bool(self._closed)
+
+
+class RawCdpContext:
+    """Minimal BrowserContext-like facade."""
+
+    def __init__(self, manager: "CDPBrowserManager"):
+        self.manager = manager
+        self.pages: list[RawCdpPage] = []
+
+    async def new_page(self) -> RawCdpPage:
+        page = await self.manager._create_page(url="about:blank")
+        self.pages.append(page)
+        return page
+
+    async def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
+        if not cookies:
+            return
+        session_id = await self.manager._ensure_session()
+        normalized: list[dict[str, Any]] = []
+        for cookie in cookies:
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name", "")).strip()
+            value = str(cookie.get("value", ""))
+            if not name:
+                continue
+            item: dict[str, Any] = {
+                "name": name,
+                "value": value,
+            }
+            for key in ("url", "domain", "path", "secure", "httpOnly", "sameSite", "expires"):
+                if key in cookie:
+                    item[key] = cookie[key]
+            normalized.append(item)
+        if not normalized:
+            return
+        await self.manager.connection.send(
+            "Network.setCookies",
+            {"cookies": normalized},
+            session_id=session_id,
+        )
+
+    async def cookies(self, urls: list[str] | None = None) -> list[dict[str, Any]]:
+        session_id = await self.manager._ensure_session()
+        params: dict[str, Any] = {}
+        if urls:
+            params["urls"] = [str(u) for u in urls if u]
+        payload = await self.manager.connection.send(
+            "Network.getCookies",
+            params,
+            session_id=session_id,
+        )
+        rows = payload.get("cookies", [])
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+        return []
+
+    async def storage_state(self, path: str = "") -> dict[str, Any]:
+        payload = {
+            "cookies": await self.cookies(),
+            "origins": [],
+        }
+        if path:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return payload
+
+    async def close(self) -> None:
+        pages = list(self.pages)
+        self.pages.clear()
+        for page in pages:
+            try:
+                await page.close()
+            except Exception:
+                continue
+
+
 class CDPBrowserManager:
-    """
-    CDP browser manager, responsible for launching and managing browsers connected via CDP
-    Adapted for Taobao Market Research
-    """
+    """Native CDP browser manager compatible with existing call sites."""
 
     def __init__(
         self,
@@ -27,260 +627,244 @@ class CDPBrowserManager:
         debug_port: int = 9222,
         save_login_state: bool = True,
         user_data_dir_template: str = "taobao_cdp_profile",
-        auto_close_browser: bool = False,  # 默认不关闭，保护用户浏览器
+        auto_close_browser: bool = False,
         browser_launch_timeout: int = 30,
-        safe_mode: bool = True,  # 安全模式：避开常用端口
+        safe_mode: bool = True,
+        cdp_url: str = "",
     ):
-        self.launcher = BrowserLauncher()
-        self.browser: Optional[Browser] = None
-        self.browser_context: Optional[BrowserContext] = None
+        self.browser_process: Optional[subprocess.Popen] = None
+        self.browser_context: Optional[RawCdpContext] = None
+        self.connection: Optional[CdpConnection] = None
         self.debug_port: Optional[int] = None
+        self.ws_url: str = ""
 
-        # Configuration
         self.custom_browser_path = custom_browser_path
-        self.config_debug_port = debug_port
-        self.save_login_state = save_login_state
-        self.user_data_dir_template = user_data_dir_template
-        self.auto_close_browser = auto_close_browser
-        self.browser_launch_timeout = browser_launch_timeout
-        self.safe_mode = safe_mode
-
+        self.config_debug_port = int(debug_port)
+        self.save_login_state = bool(save_login_state)
+        self.user_data_dir_template = str(user_data_dir_template or "taobao_cdp_profile")
+        self.auto_close_browser = bool(auto_close_browser)
+        self.browser_launch_timeout = max(5, int(browser_launch_timeout))
+        self.safe_mode = bool(safe_mode)
+        self.cdp_url = str(cdp_url or "").strip()
         self._cleanup_registered = False
+        self._stealth_script_source = ""
 
-    def _register_cleanup_handlers(self):
-        """Register cleanup handlers"""
+    def _register_cleanup_handlers(self) -> None:
         if self._cleanup_registered:
             return
 
-        def sync_cleanup():
-            if self.launcher and self.launcher.browser_process:
-                utils.logger.info("[CDPBrowserManager] atexit: Cleaning up browser process")
-                self.launcher.cleanup()
+        def _sync_cleanup() -> None:
+            if self.browser_process and self.browser_process.poll() is None:
+                try:
+                    self.browser_process.terminate()
+                except Exception:
+                    pass
 
-        atexit.register(sync_cleanup)
+        atexit.register(_sync_cleanup)
 
         prev_sigint = signal.getsignal(signal.SIGINT)
         prev_sigterm = signal.getsignal(signal.SIGTERM)
 
-        def signal_handler(signum, frame):
-            utils.logger.info(f"[CDPBrowserManager] Received signal {signum}, cleaning up")
-            if self.launcher and self.launcher.browser_process:
-                self.launcher.cleanup()
+        def _signal_handler(signum: int, frame: Any) -> None:
+            _ = frame
+            if self.browser_process and self.browser_process.poll() is None:
+                try:
+                    self.browser_process.terminate()
+                except Exception:
+                    pass
             if signum == signal.SIGINT:
                 if prev_sigint == signal.default_int_handler:
-                    return prev_sigint(signum, frame)
-                raise KeyboardInterrupt
+                    raise KeyboardInterrupt
+                if callable(prev_sigint):
+                    prev_sigint(signum, frame)
             raise SystemExit(0)
 
-        install_sigint = prev_sigint in (signal.default_int_handler, signal.SIG_DFL)
-        install_sigterm = prev_sigterm == signal.SIG_DFL
-
-        if install_sigint:
-            signal.signal(signal.SIGINT, signal_handler)
-        if install_sigterm:
-            signal.signal(signal.SIGTERM, signal_handler)
+        if prev_sigint in (signal.default_int_handler, signal.SIG_DFL):
+            signal.signal(signal.SIGINT, _signal_handler)
+        if prev_sigterm == signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, _signal_handler)
 
         self._cleanup_registered = True
-        utils.logger.info("[CDPBrowserManager] Cleanup handlers registered")
+
+    def _resolve_user_data_dir(self) -> str:
+        if not self.save_login_state:
+            return ""
+        path = self.user_data_dir_template
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = Path(os.getcwd()) / "browser_data" / path
+        candidate.mkdir(parents=True, exist_ok=True)
+        return str(candidate.resolve())
+
+    async def _launch_browser_process(self, browser_path: str, headless: bool = False) -> None:
+        start_port = 9330 if self.safe_mode else self.config_debug_port
+        self.debug_port = _find_available_port(start_port=start_port)
+        user_data_dir = self._resolve_user_data_dir()
+
+        args = [
+            browser_path,
+            f"--remote-debugging-port={self.debug_port}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+            "--start-maximized",
+        ]
+        if user_data_dir:
+            args.append(f"--user-data-dir={user_data_dir}")
+        if headless:
+            args.extend(["--headless=new", "--disable-gpu"])
+
+        utils.logger.info("[CDPBrowserManager] launching browser path=%s", browser_path)
+        utils.logger.info("[CDPBrowserManager] debug_port=%s safe_mode=%s", self.debug_port, self.safe_mode)
+        self.browser_process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if _is_windows() else 0,
+        )
+        self.ws_url = await _wait_ws_url_from_debug_port(
+            int(self.debug_port),
+            timeout_sec=self.browser_launch_timeout,
+        )
+
+    async def _connect_browser_level(self) -> None:
+        if not self.ws_url:
+            raise RuntimeError("empty websocket debugger url")
+        self.connection = await CdpConnection.connect(
+            self.ws_url,
+            timeout_sec=max(10.0, float(self.browser_launch_timeout)),
+        )
+
+    async def _create_page(self, url: str = "about:blank", user_agent: str = "") -> RawCdpPage:
+        if self.connection is None:
+            raise RuntimeError("CDP connection is not initialized")
+        create_result = await self.connection.send(
+            "Target.createTarget",
+            {"url": str(url or "about:blank")},
+            timeout_sec=20.0,
+        )
+        target_id = str(create_result.get("targetId", "")).strip()
+        if not target_id:
+            raise RuntimeError("failed to create CDP target")
+        attach_result = await self.connection.send(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": True},
+            timeout_sec=20.0,
+        )
+        session_id = str(attach_result.get("sessionId", "")).strip()
+        if not session_id:
+            raise RuntimeError("failed to attach CDP target")
+
+        page = RawCdpPage(manager=self, target_id=target_id, session_id=session_id)
+        await page.initialize(user_agent=user_agent)
+        return page
+
+    async def _ensure_session(self) -> str:
+        if self.browser_context is None:
+            raise RuntimeError("CDP browser context is not initialized")
+        for page in self.browser_context.pages:
+            if not page.is_closed():
+                return page.session_id
+        page = await self._create_page(url="about:blank")
+        self.browser_context.pages.append(page)
+        return page.session_id
 
     async def launch_and_connect(
         self,
-        playwright: Playwright,
-        playwright_proxy: Optional[Dict] = None,
+        playwright: Any = None,
+        playwright_proxy: Optional[Dict[str, Any]] = None,
         user_agent: Optional[str] = None,
         headless: bool = False,
-    ) -> BrowserContext:
-        """Launch browser and connect via CDP"""
+    ) -> RawCdpContext:
+        _ = playwright
+        _ = playwright_proxy
         try:
-            browser_path = await self._get_browser_path()
-            # Safe mode: use higher port range to avoid conflicts with user's browser
-            start_port = 9330 if self.safe_mode else self.config_debug_port
-            self.debug_port = self.launcher.find_available_port(start_port)
-            utils.logger.info(f"[CDPBrowserManager] Using port: {self.debug_port} (safe_mode={self.safe_mode})")
-            await self._launch_browser(browser_path, headless)
+            if self.cdp_url:
+                self.ws_url = await _resolve_ws_url(self.cdp_url)
+                utils.logger.info("[CDPBrowserManager] connecting to existing CDP endpoint: %s", self.cdp_url)
+            else:
+                browser_path = _find_chrome_executable(self.custom_browser_path)
+                await self._launch_browser_process(browser_path=browser_path, headless=headless)
+
+            await self._connect_browser_level()
+            self.browser_context = RawCdpContext(manager=self)
+            first_page = await self._create_page(
+                url="https://www.taobao.com",
+                user_agent=user_agent or "",
+            )
+            self.browser_context.pages.append(first_page)
             self._register_cleanup_handlers()
-            await self._connect_via_cdp(playwright)
-            browser_context = await self._create_browser_context(playwright_proxy, user_agent)
-            self.browser_context = browser_context
-            return browser_context
-        except Exception as e:
-            utils.logger.error(f"[CDPBrowserManager] CDP browser launch failed: {e}")
-            await self.cleanup()
+            return self.browser_context
+        except Exception as exc:
+            utils.logger.error("[CDPBrowserManager] launch_and_connect failed: %s", exc)
+            await self.cleanup(force=True)
             raise
 
-    async def _get_browser_path(self) -> str:
-        """Get browser path"""
-        if self.custom_browser_path and os.path.isfile(self.custom_browser_path):
-            utils.logger.info(f"[CDPBrowserManager] Using custom browser: {self.custom_browser_path}")
-            return self.custom_browser_path
-
-        browser_paths = self.launcher.detect_browser_paths()
-        if not browser_paths:
-            raise RuntimeError(
-                "No browser found. Please install Chrome/Edge or set CUSTOM_BROWSER_PATH"
-            )
-
-        browser_path = browser_paths[0]
-        browser_name, browser_version = self.launcher.get_browser_info(browser_path)
-        utils.logger.info(f"[CDPBrowserManager] Detected: {browser_name} ({browser_version})")
-        return browser_path
-
-    async def _launch_browser(self, browser_path: str, headless: bool):
-        """Launch browser process"""
-        user_data_dir = None
-        if self.save_login_state:
-            user_data_dir = os.path.join(
-                os.getcwd(),
-                "browser_data",
-                self.user_data_dir_template,
-            )
-            os.makedirs(user_data_dir, exist_ok=True)
-            utils.logger.info(f"[CDPBrowserManager] User data dir: {user_data_dir}")
-
-        self.launcher.browser_process = self.launcher.launch_browser(
-            browser_path=browser_path,
-            debug_port=self.debug_port,
-            headless=headless,
-            user_data_dir=user_data_dir,
-        )
-
-        if not self.launcher.wait_for_browser_ready(self.debug_port, self.browser_launch_timeout):
-            raise RuntimeError(f"Browser failed to start within {self.browser_launch_timeout}s")
-
-        await asyncio.sleep(1)
-
-    async def _connect_via_cdp(self, playwright: Playwright):
-        """Connect to browser via CDP"""
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"http://localhost:{self.debug_port}/json/version", timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    ws_url = data.get("webSocketDebuggerUrl")
-                    if not ws_url:
-                        raise RuntimeError("webSocketDebuggerUrl not found")
-                else:
-                    raise RuntimeError(f"HTTP {response.status_code}")
-        except Exception as e:
-            utils.logger.error(f"[CDPBrowserManager] Failed to get WebSocket URL: {e}")
-            raise
-
-        utils.logger.info(f"[CDPBrowserManager] Connecting via CDP: {ws_url}")
-        self.browser = await playwright.chromium.connect_over_cdp(ws_url)
-
-        if self.browser.is_connected():
-            utils.logger.info("[CDPBrowserManager] Connected successfully")
-        else:
-            raise RuntimeError("CDP connection failed")
-
-    async def _create_browser_context(
-        self, playwright_proxy: Optional[Dict] = None, user_agent: Optional[str] = None
-    ) -> BrowserContext:
-        """Create or get browser context"""
-        if not self.browser:
-            raise RuntimeError("Browser not connected")
-
-        contexts = self.browser.contexts
-
-        if contexts:
-            browser_context = contexts[0]
-            utils.logger.info("[CDPBrowserManager] Using existing context")
-        else:
-            context_options = {
-                "viewport": {"width": 1920, "height": 1080},
-                "accept_downloads": True,
-            }
-
-            if user_agent:
-                context_options["user_agent"] = user_agent
-                utils.logger.info(f"[CDPBrowserManager] Setting UA: {user_agent}")
-
-            if playwright_proxy:
-                utils.logger.warning("[CDPBrowserManager] Proxy may not work in CDP mode")
-
-            browser_context = await self.browser.new_context(**context_options)
-            utils.logger.info("[CDPBrowserManager] Created new context")
-
-        return browser_context
-
-    async def add_stealth_script(self, script_path: str = None):
-        """Add anti-detection script"""
-        if script_path is None:
+    async def add_stealth_script(self, script_path: str = "") -> None:
+        if not script_path:
             script_path = os.path.join(os.path.dirname(__file__), "..", "libs", "stealth.min.js")
-
-        if self.browser_context and os.path.exists(script_path):
-            try:
-                await self.browser_context.add_init_script(path=script_path)
-                utils.logger.info(f"[CDPBrowserManager] Added stealth script: {script_path}")
-            except Exception as e:
-                utils.logger.warning(f"[CDPBrowserManager] Failed to add stealth: {e}")
-
-    async def add_cookies(self, cookies: list):
-        """Add cookies"""
-        if self.browser_context:
-            try:
-                await self.browser_context.add_cookies(cookies)
-                utils.logger.info(f"[CDPBrowserManager] Added {len(cookies)} cookies")
-            except Exception as e:
-                utils.logger.warning(f"[CDPBrowserManager] Failed to add cookies: {e}")
-
-    async def get_cookies(self) -> list:
-        """Get current cookies"""
-        if self.browser_context:
-            try:
-                return await self.browser_context.cookies()
-            except Exception as e:
-                utils.logger.warning(f"[CDPBrowserManager] Failed to get cookies: {e}")
-        return []
-
-    async def cleanup(self, force: bool = False):
-        """Cleanup resources"""
+        path_obj = Path(script_path).resolve()
+        if not path_obj.exists():
+            return
         try:
+            self._stealth_script_source = path_obj.read_text(encoding="utf-8", errors="ignore")
             if self.browser_context:
+                for page in self.browser_context.pages:
+                    if page.is_closed():
+                        continue
+                    try:
+                        await self.connection.send(
+                            "Page.addScriptToEvaluateOnNewDocument",
+                            {"source": self._stealth_script_source},
+                            session_id=page.session_id,
+                        )
+                    except Exception:
+                        continue
+            utils.logger.info("[CDPBrowserManager] stealth script registered")
+        except Exception as exc:
+            utils.logger.warning("[CDPBrowserManager] add_stealth_script failed: %s", exc)
+
+    async def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
+        if self.browser_context is None:
+            return
+        await self.browser_context.add_cookies(cookies)
+
+    async def get_cookies(self) -> list[dict[str, Any]]:
+        if self.browser_context is None:
+            return []
+        return await self.browser_context.cookies()
+
+    async def cleanup(self, force: bool = False) -> None:
+        try:
+            if self.browser_context is not None:
                 try:
                     await self.browser_context.close()
-                    utils.logger.info("[CDPBrowserManager] Context closed")
                 except Exception:
-                    utils.logger.debug("[CDPBrowserManager] Context already closed")
-                finally:
-                    self.browser_context = None
+                    pass
+                self.browser_context = None
 
-            if self.browser:
+            if self.connection is not None:
                 try:
-                    if self.browser.is_connected():
-                        await self.browser.close()
-                        utils.logger.info("[CDPBrowserManager] Browser disconnected")
+                    await self.connection.close()
                 except Exception:
-                    utils.logger.debug("[CDPBrowserManager] Browser already disconnected")
-                finally:
-                    self.browser = None
-
-            if force or self.auto_close_browser:
-                if self.launcher and self.launcher.browser_process:
-                    self.launcher.cleanup()
-            else:
-                utils.logger.info("[CDPBrowserManager] Browser kept running")
-
-        except Exception as e:
-            utils.logger.error(f"[CDPBrowserManager] Cleanup error: {e}")
+                    pass
+                self.connection = None
+        finally:
+            should_close_process = bool(force or self.auto_close_browser)
+            if should_close_process and self.browser_process is not None:
+                try:
+                    self.browser_process.terminate()
+                except Exception:
+                    pass
+                self.browser_process = None
 
     def is_connected(self) -> bool:
-        """Check if connected"""
-        return self.browser is not None and self.browser.is_connected()
+        return self.connection is not None and self.connection.is_connected
 
     async def get_browser_info(self) -> Dict[str, Any]:
-        """Get browser info"""
-        if not self.browser:
-            return {}
-        try:
-            return {
-                "version": self.browser.version,
-                "contexts_count": len(self.browser.contexts),
-                "debug_port": self.debug_port,
-                "is_connected": self.is_connected(),
-            }
-        except Exception as e:
-            utils.logger.warning(f"[CDPBrowserManager] Failed to get info: {e}")
-            return {}
+        return {
+            "debug_port": self.debug_port,
+            "ws_url": self.ws_url,
+            "contexts_count": 1 if self.browser_context is not None else 0,
+            "is_connected": self.is_connected(),
+        }

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-环境检测脚本 (Environment Check Script)
-淘宝市场调研默认使用 persistent 模式自动拉起浏览器并复用登录态；
-只有在显式使用 cdp 模式时才要求本机暴露 9222 端口。
-本脚本将在端到端流程启动前快速执行，以确认环境搭建是否满足先决条件。
+Environment check script for browser automation runtime.
+
+Default mode is CDP-first. This script validates dependencies, environment
+variables, cached login state, and CDP endpoint availability before pipeline
+startup.
 """
 
 import os
@@ -13,6 +14,11 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+try:
+    from tools.login_rules import LOGIN_COOKIE_NAMES
+except Exception:
+    LOGIN_COOKIE_NAMES = {"cookie2", "unb", "_tb_token_", "_m_h5_tk"}
 
 
 def print_step(msg: str) -> None:
@@ -102,7 +108,7 @@ def check_login_state_cache() -> bool:
     if user_data_dir != recommended_user_data_dir:
         print(f"⚠️ 建议固定 TAOBAO_USER_DATA_DIR 为: {recommended_user_data_dir}")
 
-    login_cookie_names = {"cookie2", "unb", "_tb_token_", "_m_h5_tk"}
+    login_cookie_names = set(LOGIN_COOKIE_NAMES)
     taobao_domains = ("taobao.com", "tmall.com")
     now_ts = int(time.time())
     valid_cookie_count = 0
@@ -153,10 +159,10 @@ def check_login_state_cache() -> bool:
 
 
 def resolve_browser_mode() -> str:
-    mode = str(os.environ.get("TAOBAO_BROWSER_MODE", "persistent") or "persistent")
+    mode = str(os.environ.get("TAOBAO_BROWSER_MODE", "cdp") or "cdp")
     mode = mode.strip().lower()
     if mode not in {"cdp", "persistent"}:
-        return "persistent"
+        return "cdp"
     return mode
 
 
@@ -167,8 +173,16 @@ def check_browser_connection(browser_mode: str) -> bool:
         print("ℹ️ 无需预先手动开启 9222 CDP 端口。")
         return True
 
+    cdp_url = (
+        os.environ.get("PLAYWRIGHT_CDP_URL", "")
+        or os.environ.get("TAOBAO_CDP_ENDPOINT", "")
+    ).strip()
+    if not cdp_url:
+        print_step("CDP 配置检查")
+        print("✅ 当前为 cdp 模式：未设置外部 CDP 端点，将由原生 CDP 管理器自动拉起浏览器并完成连接。")
+        return True
+
     print_step("检测 Chrome CDP 远程调试端口")
-    cdp_url = os.environ.get("PLAYWRIGHT_CDP_URL", "http://127.0.0.1:9222")
     print(f"正在尝试连接 CDP 端口: {cdp_url}")
 
     # 对于 /json/version，Chrome CDP 会返回当前支持的信息
@@ -224,3 +238,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

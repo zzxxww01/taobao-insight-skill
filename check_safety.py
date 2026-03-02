@@ -58,7 +58,6 @@ def check_safety_settings():
         print("\nRecommended usage:")
         print("  python scripts/run_pipeline.py \\")
         print("    --taobao-browser-mode persistent \\")
-        print("    --use-global-browser 1 \\")
         print("    final-csv \"粉饼\" --top-n 5")
     else:
         print("[FAIL] Some safety checks failed")

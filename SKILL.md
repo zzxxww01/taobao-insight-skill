@@ -75,15 +75,15 @@ $env:PYTHONIOENCODING="utf-8"
 $env:TAOBAO_BROWSER_MODE="persistent"
 $env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\taobao_insight_profile"
 $env:TAOBAO_STORAGE_STATE_FILE="skills\\taobao-insight\\data\\taobao_storage_state.json"
-python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-workers 64 --taobao-browser-mode persistent final-csv "<用户提供的 keyword>" --top-n <用户指定的数字> --search-backend playwright --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
+python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 --taobao-browser-mode persistent final-csv "<用户提供的 keyword>" --top-n <用户指定的数字> --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
 ```
 
 **关键参数说明**：
 - `--taobao-browser-mode persistent`: 使用持久化浏览器模式（**自动启动浏览器**，不需要手动启动 CDP）
-- `--use-global-browser 1`: 启用全局浏览器管理器（单一事件循环架构，登录只需一次）
+- 浏览器管理器默认启用（无需单独参数）。
 - `--crawl-workers 1`: 使用单一事件循环（重要：避免 Playwright 连接问题）
 - `--llm-workers 64`: LLM 并发数（Flash 模型默认 64，Pro 模型建议 16）
-- `--search-backend playwright`: 使用 Playwright 进行搜索（必须）
+- 搜索路径固定为统一浏览器链路（无需单独参数）。
 - `--top-n N`: 抓取前 N 个商品
 
 #### 性能优化（2026-02-28）
@@ -195,7 +195,7 @@ python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-worker
 
 Use this flow when you need maximum reproducibility and want to push sample success rate to 100%.
 
-1. Keep `--taobao-browser-mode persistent`, `--use-global-browser 1`, `--crawl-workers 1`.
+1. Keep `--taobao-browser-mode persistent` and `--crawl-workers 1`.
 2. Freeze the sample set first, then run analysis with input URLs:
    - Step A (optional): get top-N URLs from search.
    - Step B (recommended): run `final-csv` with `--item-urls-file <frozen_urls.txt>`.
@@ -213,5 +213,5 @@ Reference command (PowerShell):
 $env:PYTHONIOENCODING="utf-8"
 $env:TAOBAO_BROWSER_MODE="persistent"
 $env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\taobao_insight_profile"
-python scripts/pipeline.py --use-global-browser 1 --crawl-workers 1 --llm-workers 16 --taobao-browser-mode persistent final-csv "口红" --top-n 10 --search-backend playwright --item-urls-file "data/exports/kouhong-top10-urls.txt" --output "data/exports/taobao-kouhong-top10.md" --html-output "data/exports/taobao-kouhong-top10.html"
+python scripts/pipeline.py --crawl-workers 1 --llm-workers 16 --taobao-browser-mode persistent final-csv "口红" --top-n 10 --item-urls-file "data/exports/kouhong-top10-urls.txt" --output "data/exports/taobao-kouhong-top10.md" --html-output "data/exports/taobao-kouhong-top10.html"
 ```
