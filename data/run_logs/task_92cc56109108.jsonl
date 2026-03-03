@@ -1,0 +1,17 @@
+{"ts": "2026-03-01T01:47:33+08:00", "stage": "run-start", "status": "ok", "task_id": "task_92cc56109108", "workbook_id": "wb_344d23a22f5e", "keyword": "口红", "top_n": 10, "search_elapsed_sec": 0.0, "search_records": 10, "crawl_workers": 1, "llm_workers": 16}
+{"ts": "2026-03-01T01:47:33+08:00", "stage": "target-build", "status": "ok", "target_count": 10}
+{"ts": "2026-03-01T01:47:33+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "564093547806"}
+{"ts": "2026-03-01T01:53:51+08:00", "stage": "crawl-item-end", "status": "error", "item_id": "564093547806", "error": "TargetClosedError: BrowserType.launch_persistent_context: Target page, context or browser has been closed Browser logs: <launching> C:\\Program Files\\Google\\Chrome\\Application\\ch..."}
+{"ts": "2026-03-01T01:53:51+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "582320504739"}
+{"ts": "2026-03-01T02:00:08+08:00", "stage": "crawl-item-end", "status": "error", "item_id": "582320504739", "error": "TargetClosedError: BrowserType.launch_persistent_context: Target page, context or browser has been closed Browser logs: <launching> C:\\Program Files\\Google\\Chrome\\Application\\ch..."}
+{"ts": "2026-03-01T02:00:08+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "610251972724"}
+{"ts": "2026-03-01T02:06:25+08:00", "stage": "crawl-item-end", "status": "error", "item_id": "610251972724", "error": "TargetClosedError: BrowserType.launch_persistent_context: Target page, context or browser has been closed Browser logs: <launching> C:\\Program Files\\Google\\Chrome\\Application\\ch..."}
+{"ts": "2026-03-01T02:06:25+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "610491349125"}
+{"ts": "2026-03-01T02:12:43+08:00", "stage": "crawl-item-end", "status": "error", "item_id": "610491349125", "error": "TargetClosedError: BrowserType.launch_persistent_context: Target page, context or browser has been closed Browser logs: <launching> C:\\Program Files\\Google\\Chrome\\Application\\ch..."}
+{"ts": "2026-03-01T02:12:43+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "671553774918"}
+{"ts": "2026-03-01T02:18:59+08:00", "stage": "crawl-item-end", "status": "error", "item_id": "671553774918", "error": "TargetClosedError: BrowserType.launch_persistent_context: Target page, context or browser has been closed Browser logs: <launching> C:\\Program Files\\Google\\Chrome\\Application\\ch..."}
+{"ts": "2026-03-01T02:18:59+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "637183926212"}
+{"ts": "2026-03-01T02:25:17+08:00", "stage": "crawl-item-end", "status": "error", "item_id": "637183926212", "error": "TargetClosedError: BrowserType.launch_persistent_context: Target page, context or browser has been closed Browser logs: <launching> C:\\Program Files\\Google\\Chrome\\Application\\ch..."}
+{"ts": "2026-03-01T02:25:17+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "855123817469"}
+{"ts": "2026-03-01T02:31:34+08:00", "stage": "crawl-item-end", "status": "error", "item_id": "855123817469", "error": "TargetClosedError: BrowserType.launch_persistent_context: Target page, context or browser has been closed Browser logs: <launching> C:\\Program Files\\Google\\Chrome\\Application\\ch..."}
+{"ts": "2026-03-01T02:31:34+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "587591880726"}
