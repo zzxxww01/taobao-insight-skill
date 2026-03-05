@@ -26,13 +26,32 @@ $env:PYTHONIOENCODING="utf-8"; python scripts/check_env.py
 
 ## 阶段 2: 解析意图
 
-从用户指令中提取两个参数：
-- `keyword`: 目标商品词
-- `top_n`: 抓取数量（默认 30）
+从用户指令中提取三类参数：
+- `input_mode`: 输入模式（`keyword` / `item_urls` / `item_urls_file`）
+- `keyword`: 关键词模式下的目标商品词；URL 模式下用于命名任务的占位词
+- `top_n`: 抓取数量（关键词模式默认 30）
 
-示例："调研排名前 20 的猫粮" → `keyword=猫粮, top_n=20`
+### 输入模式识别规则
+- `keyword`：用户给的是搜索词，例如“调研排名前 20 的猫粮”
+- `item_urls`：用户直接给了一个或多个商品链接（淘宝/天猫详情页）
+- `item_urls_file`：用户给了一个 `.txt` 文件路径，文件内每行一个商品链接
 
-如果用户没指定数量，告知："我将抓取前 30 名销售爆款并输出。"
+### 每种输入的处理方法
+- `keyword`
+  - 参数：`keyword=<搜索词>`，`top_n=<用户指定或30>`
+  - 示例：`keyword=猫粮, top_n=20`
+  - 若未指定数量，必须告知用户："我将抓取前 30 名销售爆款并输出。"
+- `item_urls`
+  - 参数：提取所有 URL 到 `item_urls[]`；将 `top_n` 设为 `len(item_urls)`（用户另有指定则取二者较小值）
+  - 关键词占位：`keyword` 使用可追踪字符串（如 `direct-items-<日期>` 或 `tmall-item-<item_id>`）
+  - 说明：该模式会跳过搜索阶段，直接抓取商品详情并分析
+- `item_urls_file`
+  - 参数：读取 txt（UTF-8）后得到 `item_urls[]`，过滤空行与重复行；`top_n` 默认 `len(item_urls)`（最大不超过系统上限）
+  - 关键词占位：同 URL 模式，使用可追踪占位词
+  - 说明：该模式同样跳过搜索阶段
+
+### 混合输入优先级
+- 若同时出现关键词与 URL/URL 文件，优先使用 URL 输入（`item_urls` 或 `item_urls_file`），并在回复中明确“已按链接直抓，跳过关键词搜索”。
 
 ---
 
@@ -50,6 +69,25 @@ $env:TAOBAO_STORAGE_STATE_FILE="skills\\taobao-insight\\data\\taobao_storage_sta
 python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<keyword>" --top-n <top_n> --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
 ```
 
+### 3.1 关键词输入（`keyword`）
+```powershell
+python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<keyword>" --top-n <top_n> --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
+```
+
+### 3.2 一个或多个链接输入（`item_urls`）
+```powershell
+python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<placeholder_keyword>" --top-n <top_n> --item-url "<url_1>" --item-url "<url_2>" --output "data/exports/<placeholder_keyword>-top<top_n>.md" --html-output "data/exports/<placeholder_keyword>-top<top_n>.html"
+```
+- `<placeholder_keyword>` 仅用于任务命名，不参与搜索。
+- `top_n` 建议等于链接数量（或不超过链接数量）。
+
+### 3.3 txt 文件输入（`item_urls_file`）
+```powershell
+python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<placeholder_keyword>" --top-n <top_n> --item-urls-file "<urls.txt>" --output "data/exports/<placeholder_keyword>-top<top_n>.md" --html-output "data/exports/<placeholder_keyword>-top<top_n>.html"
+```
+- `<urls.txt>` 要求：每行 1 个商品链接，建议 UTF-8 编码。
+- 处理时需过滤空行、重复链接；`top_n` 默认取有效链接条数。
+
 **参数速查**：
 | 参数 | 说明 |
 |---|---|
@@ -58,7 +96,8 @@ python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<keywor
 | `--top-n N` | 抓取前 N 个商品 |
 | `--taobao-browser-mode` | 默认 `cdp`（自动降级 persistent），一般不用指定 |
 | `--playwright-cdp-url` | 可选，连接已有浏览器实例 |
-| `--item-urls-file` | 可选，传入已有 URL 列表跳过搜索阶段 |
+| `--item-url` | 可重复，多次传入多个商品链接（跳过搜索阶段） |
+| `--item-urls-file` | 可选，传入 URL 文件（每行一个链接，跳过搜索阶段） |
 
 **登录行为**：
 - 首次运行弹出浏览器等待扫码（最多 300 秒），后续运行自动复用 cookies

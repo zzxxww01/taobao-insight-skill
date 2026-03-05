@@ -14,6 +14,7 @@
 
 - **原生 CDP 浏览器控制** - 直接通过 Chrome DevTools Protocol 操控浏览器，CDP 失败时自动降级到 Playwright persistent 模式
 - **自动扫码登录** - 首次运行自动弹出浏览器等待扫码，登录状态自动持久化
+- **三种输入模式** - 支持关键词搜索、一个/多个商品链接直抓、以及 `.txt` 链接文件批量导入
 - **AI 卖点提取** - 使用 Gemini AI 分析商品详情，提取核心卖点
 - **市场分析报告** - 汇总竞品数据，生成市场空白点分析、卖点聚类等商业洞察
 - **双格式输出** - 自动生成 Markdown 数据表和 HTML 可视化报告
@@ -66,15 +67,48 @@
 GEMINI_API_KEY=你的_api_key_这里
 ```
 
-### 2. 运行分析
-
-在 Claude Code 中发送指令：
-
-```
-帮我抓取淘宝上"粉饼"排名前 30 的产品，生成市场报告
-```
+### 2. 运行分析（支持 3 种输入）
 
 首次运行时浏览器会自动启动并等待扫码登录，登录成功后自动保存状态。
+
+#### 2.1 输入关键词（`keyword`）
+
+- Claude Code 指令示例：
+  ```
+  帮我抓取淘宝上"粉饼"排名前 30 的产品，生成市场报告
+  ```
+- CLI 示例（PowerShell）：
+  ```powershell
+  $env:PYTHONIOENCODING="utf-8"
+  python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "粉饼" --top-n 30 --output "data/exports/粉饼-top30.md" --html-output "data/exports/粉饼-top30.html"
+  ```
+
+#### 2.2 输入一个或多个商品链接（`item_urls`）
+
+- Claude Code 指令示例：
+  ```
+  帮我分析这几个链接商品：https://detail.tmall.com/item.htm?... https://item.taobao.com/item.htm?...
+  ```
+- CLI 示例（PowerShell）：
+  ```powershell
+  $env:PYTHONIOENCODING="utf-8"
+  python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "direct-items-20260306" --top-n 2 --item-url "<url_1>" --item-url "<url_2>" --output "data/exports/direct-items-20260306-top2.md" --html-output "data/exports/direct-items-20260306-top2.html"
+  ```
+
+#### 2.3 输入 txt 链接文件（`item_urls_file`）
+
+- 文件要求：`txt` 每行 1 个商品链接，建议 UTF-8 编码。
+- Claude Code 指令示例：
+  ```
+  帮我读取 C:\data\tmall_urls.txt 里的链接并做商品分析
+  ```
+- CLI 示例（PowerShell）：
+  ```powershell
+  $env:PYTHONIOENCODING="utf-8"
+  python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "direct-file-20260306" --top-n 30 --item-urls-file "C:\data\tmall_urls.txt" --output "data/exports/direct-file-20260306-top30.md" --html-output "data/exports/direct-file-20260306-top30.html"
+  ```
+
+> 说明：`item_urls` / `item_urls_file` 模式会跳过搜索阶段，直接抓取商品详情并分析。
 
 ---
 
@@ -129,10 +163,11 @@ LLM_WORKERS_MIN=32
 ## 工作流程
 
 1. **环境检查** - 检测 Python 依赖和 API 配置
-2. **浏览器启动** - 通过原生 CDP 自动启动浏览器（失败时降级到 Playwright），首次运行提示扫码登录
-3. **数据爬取** - 控制浏览器获取商品列表和详情页数据
-4. **AI 分析** - 使用 Gemini 清洗数据，提取产品卖点（爬虫与 LLM 流水线并行执行）
-5. **报告生成** - 生成 Markdown 数据表和 HTML 可视化报告
+2. **输入解析** - 自动识别 `keyword` / `item_urls` / `item_urls_file` 三种输入模式
+3. **浏览器启动** - 通过原生 CDP 自动启动浏览器（失败时降级到 Playwright），首次运行提示扫码登录
+4. **数据爬取** - 关键词模式先搜索再抓取；链接模式跳过搜索，直接抓取详情页数据
+5. **AI 分析** - 使用 Gemini 清洗数据，提取产品卖点（爬虫与 LLM 流水线并行执行）
+6. **报告生成** - 生成 Markdown 数据表和 HTML 可视化报告
 
 ---
 
@@ -157,6 +192,14 @@ A: 可以在 `.env` 中增加 `GEMINI_TIMEOUT_SEC` 到 180 秒以上，或配置
 ### Q: 浏览器启动失败怎么办？
 
 A: 关闭所有 Chrome 进程后重试。如果系统找不到 Chrome/Edge，可设置 `CUSTOM_BROWSER_PATH` 环境变量指定浏览器路径。
+
+### Q: 可以同时给关键词和链接吗？
+
+A: 可以。系统会优先按链接模式执行（跳过搜索阶段），关键词仅用于任务命名。
+
+### Q: txt 文件有什么格式要求？
+
+A: 建议 UTF-8 编码，每行一个淘宝/天猫商品详情链接。空行和重复链接会被自动忽略。
 
 ---
 

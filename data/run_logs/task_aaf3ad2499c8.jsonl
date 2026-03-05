@@ -1,8 +1,0 @@
-{"ts": "2026-03-01T13:23:16+08:00", "stage": "run-start", "status": "ok", "task_id": "task_aaf3ad2499c8", "workbook_id": "wb_ac8bd277d993", "keyword": "口红", "top_n": 1, "search_elapsed_sec": 0.0, "search_records": 1, "crawl_workers": 1, "llm_workers": 8}
-{"ts": "2026-03-01T13:23:16+08:00", "stage": "target-build", "status": "ok", "target_count": 1}
-{"ts": "2026-03-01T13:23:16+08:00", "stage": "crawl-item-start", "status": "ok", "item_id": "564093547806"}
-{"ts": "2026-03-01T13:24:19+08:00", "stage": "crawl-item-end", "status": "ok", "item_id": "564093547806"}
-{"ts": "2026-03-01T13:24:19+08:00", "stage": "crawl-stage-end", "status": "ok", "crawl_success": 1, "crawl_failed": 0, "crawl_elapsed_sec": 62.528}
-{"ts": "2026-03-01T13:24:41+08:00", "stage": "llm-extract-end", "status": "ok", "llm_extract_success": 1, "llm_extract_failed": 0, "llm_extract_elapsed_sec": 84.432}
-{"ts": "2026-03-01T13:25:15+08:00", "stage": "llm-analyze-end", "status": "ok", "llm_analyze_inputs": 1, "llm_analyze_failed": 0, "llm_analyze_elapsed_sec": 34.639}
-{"ts": "2026-03-01T13:26:29+08:00", "stage": "run-end", "status": "ok", "success_rate": 100.0, "failed_items": 0, "total_runtime_sec": 192.623, "run_summary_path": "data\\exports\\top1-20260301-132316-run-summary.md"}

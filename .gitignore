@@ -18,6 +18,7 @@ data/*.md
 # IDE
 .idea/
 .vscode/
+.claude/
 *.pyc
 __pycache__/
 
@@ -30,6 +31,7 @@ build/
 
 # Logs
 *.log
+data/run_logs/
 
 # OS
 .DS_Store
