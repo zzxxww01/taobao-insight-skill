@@ -1,4 +1,4 @@
-# 淘宝市场调研工具 (Taobao Insight)
+# 淘宝/京东市场调研工具 (Taobao Insight)
 
 > 一款基于 Claude Code 的 AI 市场调研工具。通过原生 CDP 自动管理浏览器与登录状态，抓取竞品数据，利用 Gemini AI 分析产品卖点，生成市场分析报告（Markdown + HTML 可视化）。
 
@@ -14,10 +14,34 @@
 
 - **原生 CDP 浏览器控制** - 直接通过 Chrome DevTools Protocol 操控浏览器，CDP 失败时自动降级到 Playwright persistent 模式
 - **自动扫码登录** - 首次运行自动弹出浏览器等待扫码，登录状态自动持久化
+- **双平台支持** - 支持淘宝/天猫与京东，两条链路共用分析和导出能力
 - **三种输入模式** - 支持关键词搜索、一个/多个商品链接直抓、以及 `.txt` 链接文件批量导入
 - **AI 卖点提取** - 使用 Gemini AI 分析商品详情，提取核心卖点
 - **市场分析报告** - 汇总竞品数据，生成市场空白点分析、卖点聚类等商业洞察
 - **双格式输出** - 自动生成 Markdown 数据表和 HTML 可视化报告
+
+---
+
+## 京东支持
+
+- **京东命令**：`jd-analyze-keyword`、`jd-final-csv`
+- **京东商品链接**：支持 `https://item.jd.com/<item_id>.html`
+- **京东关键词搜索**：默认入口为 `https://search.jd.com/Search?keyword=<keyword>&enc=utf-8`
+- **登录方式与淘宝一致**：同样走“原生 CDP 优先，失败后自动降级到 Playwright persistent”这套浏览器管理链路
+- **会话隔离**：京东默认使用独立的 `JD_*` storage state / user data dir，不和淘宝 profile 混用
+- **风控恢复方式一致**：遇到登录页、滑块页、验证页时都会暂停等待你在真实浏览器中完成，再继续抓取
+
+示例：
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python scripts/pipeline.py jd-final-csv "口红" --top-n 20 --output "data/exports/jd-口红-top20.md" --html-output "data/exports/jd-口红-top20.html"
+```
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python scripts/pipeline.py jd-final-csv "direct-jd-items-20260306" --top-n 1 --item-url "https://item.jd.com/8142476.html" --output "data/exports/direct-jd-items-20260306-top1.md" --html-output "data/exports/direct-jd-items-20260306-top1.html"
+```
 
 ---
 
@@ -223,3 +247,67 @@ A: 建议 UTF-8 编码，每行一个淘宝/天猫商品详情链接。空行和
 ## License
 
 [MIT License](LICENSE)
+
+---
+
+## 评论抓取
+
+只想爬评论时，不要用 `scripts/pipeline.py`，改用独立入口 `scripts/review_pipeline.py`。
+
+### 1. 最常用命令
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python scripts/review_pipeline.py jd-reviews "jd-lipstick-reviews" --item-url "https://item.jd.com/100259348596.html" --days 5 --limit 0
+```
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python scripts/review_pipeline.py taobao-reviews "taobao-lipstick-reviews" --item-url "https://item.taobao.com/item.htm?id=123456789" --days 7 --limit 200
+```
+
+### 2. 输入方式
+
+- 单个商品链接：`--item-url "<url>"`
+- 多个商品链接：重复传 `--item-url`
+- 直接传商品 ID：`--item-id <item_id>`
+- 从文件批量读取：`--item-urls-file "<urls.txt>"`
+
+示例：
+
+```powershell
+python scripts/review_pipeline.py jd-reviews "jd-batch" --item-id 8142476 --item-id 100259348596 --days 7 --limit 0
+python scripts/review_pipeline.py jd-reviews "jd-batch" --item-urls-file "data\jd_urls.txt" --days 7 --limit 0
+```
+
+### 3. 参数语义
+
+- `--days N`：最近 N 天；大于 0 时优先于 `--months`
+- `--months N`：最近 N 个月；默认 `2`
+- `--limit N`：每个商品最多保留 N 条；`0` 表示时间窗口内尽量全抓
+- `--output-dir <path>`：自定义输出目录
+- `--jd-browser-mode cdp|persistent`
+- `--taobao-browser-mode cdp|persistent`
+
+### 4. 输出位置
+
+输出目录默认写到：
+
+- `data/reviews_exports/jd/direct/...`
+- `data/reviews_exports/taobao/direct/...`
+
+单商品直抓时，目录名会优先用 `item_id`，例如：
+
+- `data/reviews_exports/jd/direct/100259348596-d5-all-20260309-001459/`
+
+目录内固定包含：
+
+- `reviews.jsonl`
+- `reviews.csv`
+- `run-summary.json`
+- `run-summary.md`
+
+### 5. 和分析流程的区别
+
+- 这里只抓评论原始数据，不做商品分析、卖点提炼、HTML/Markdown 调研报告
+- 不会写入 `products.csv`、workbook 或市场分析产物

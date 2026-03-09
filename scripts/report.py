@@ -1,4 +1,4 @@
-﻿"""CSV and HTML generation and export logic."""
+"""CSV and HTML generation and export logic."""
 
 from __future__ import annotations
 
@@ -38,6 +38,56 @@ class ReportGenerator:
         self.storage = storage
         self.workbook_service = workbook_service
         self.analyzer = analyzer
+
+    @staticmethod
+    def _platforms_for_rows(
+        rows: list[dict[str, Any]], workbook: dict[str, Any] | None = None
+    ) -> set[str]:
+        platforms: set[str] = set()
+        for row in rows:
+            value = clean_text(str(row.get("platform", "")), max_len=20).lower()
+            if value:
+                platforms.add(value)
+        if workbook:
+            workbook_platform = clean_text(
+                str(workbook.get("platform", "")), max_len=20
+            ).lower()
+            if workbook_platform:
+                platforms.add(workbook_platform)
+        return platforms
+
+    @staticmethod
+    def _detail_summary_label_for_platform(platform: str) -> str:
+        normalized = clean_text(str(platform or ""), max_len=20).lower()
+        if normalized == "jd":
+            return "商品详情卖点摘要"
+        if normalized == "taobao":
+            return "图文卖点摘要"
+        return "详情卖点摘要"
+
+    @staticmethod
+    def _report_title_for_platforms(
+        rows: list[dict[str, Any]], workbook: dict[str, Any] | None = None
+    ) -> str:
+        platforms = ReportGenerator._platforms_for_rows(rows, workbook)
+        if platforms == {"jd"}:
+            return "京东市场调研报告"
+        if platforms == {"taobao"}:
+            return "淘宝市场调研报告"
+        if not platforms:
+            return "市场调研报告"
+        return "多平台市场调研报告"
+
+    @staticmethod
+    def _detail_summary_label_for_platforms(
+        rows: list[dict[str, Any]], workbook: dict[str, Any] | None = None
+    ) -> str:
+        platforms = ReportGenerator._platforms_for_rows(rows, workbook)
+        if platforms == {"jd"}:
+            return "商品详情卖点摘要"
+        if platforms == {"taobao"}:
+            return "图文卖点摘要"
+        return "详情卖点摘要"
 
     def _get_export_filename(self, workbook: dict[str, Any], ext: str) -> str:
         name = workbook.get("workbook_name", "")
@@ -103,6 +153,7 @@ class ReportGenerator:
         market_report = self.storage.read_json(self.storage.market_report_json).get(
             workbook_id, {}
         )
+        detail_summary_label = self._detail_summary_label_for_platforms(rows, workbook)
 
         def preserve_report_text(value: Any, max_len: int = 4000) -> str:
             text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -415,6 +466,7 @@ class ReportGenerator:
                         "差异化卖点：",
                         "同质化卖点：",
                         "图文详情页引用：",
+                        "商品详情引用：",
                     )
                 ):
                     continue
@@ -459,7 +511,7 @@ class ReportGenerator:
             "商品",
             "价格",
             "核心卖点",
-            "图文卖点摘要",
+            detail_summary_label,
             "单品竞品结论",
             "市场观察",
             "最终结论",
@@ -544,6 +596,9 @@ class ReportGenerator:
         item_cards: list[str] = []
         item_cards_md: list[dict[str, Any]] = []
         for idx, row in enumerate(rows, start=1):
+            row_detail_summary_label = self._detail_summary_label_for_platform(
+                str(row.get("platform", ""))
+            )
             mapping = self.analyzer.build_row_market_mapping(row, point_freq, q1, q2)
             title_plain = (
                 clean_text(row.get("title", ""), max_len=120)
@@ -687,6 +742,7 @@ class ReportGenerator:
                     "source_url": source_url if source_url.startswith("http") else "",
                     "points": points,
                     "detail_sentence": detail_sentence,
+                    "detail_summary_label": row_detail_summary_label,
                     "comp_sentence_short": comp_sentence_short,
                     "market_sentence_short": market_sentence_short,
                     "main_image_src": main_image_src,
@@ -711,7 +767,7 @@ class ReportGenerator:
                   <div class="item-body">
                     <div class="item-meta">品牌：{brand} | 店铺：{shop} | 价格：{html_escape(price_text)} {source_link}</div>
                     <div class="item-block"><div class="item-label">核心卖点</div><div class="point-list">{point_chips}</div></div>
-                    <div class="item-block"><div class="item-label">图文卖点摘要</div><div class="item-text">{render_text(detail_sentence)}</div></div>
+                    <div class="item-block"><div class="item-label">{row_detail_summary_label}</div><div class="item-text">{render_text(detail_sentence)}</div></div>
                     <div class="item-block"><div class="item-label">单品竞品结论</div><div class="item-text">{render_text(comp_sentence_short)}</div></div>
                     <div class="item-block"><div class="item-label">市场观察</div><div class="item-text">{render_text(market_sentence_short)}</div></div>
                     {main_image_block}
@@ -730,13 +786,14 @@ class ReportGenerator:
                 f'<tr><td colspan="{len(concise_headers)}"></td></tr>'
             )
         generated_at = now_iso()
+        report_title = self._report_title_for_platforms(rows, workbook)
 
         html_doc = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>淘宝市场调研报告</title>
+  <title>{html_escape(report_title)}</title>
   <style>
     :root {{
       --bg: #f3f6fa;
@@ -1104,7 +1161,7 @@ class ReportGenerator:
 <body>
   <main class="layout">
     <section class="card">
-      <h1>淘宝市场调研报告</h1>
+      <h1>{html_escape(report_title)}</h1>
       <div class="meta">工作簿：{html_escape(workbook.get("workbook_name", workbook_id))} | 样本量：{sample_count} | 更新时间：{html_escape(generated_at)}</div>
       <div class="meta">市场标签：{html_escape(market_tags_text or "")}</div>
     </section>
@@ -1161,7 +1218,7 @@ class ReportGenerator:
 </html>
 """
         markdown_lines: list[str] = [
-            "# 淘宝市场调研报告",
+            f"# {report_title}",
             "",
             f"- 工作簿：{workbook.get('workbook_name', workbook_id)}",
             f"- 样本量：{sample_count}",
@@ -1226,7 +1283,7 @@ class ReportGenerator:
                 markdown_lines.append("- 核心卖点：")
             markdown_lines.extend(
                 [
-                    f"- 图文卖点摘要：{item['detail_sentence']}",
+                    f"- {item['detail_summary_label']}：{item['detail_sentence']}",
                     f"- 单品竞品结论：{item['comp_sentence_short']}",
                     f"- 市场观察：{item['market_sentence_short']}",
                 ]

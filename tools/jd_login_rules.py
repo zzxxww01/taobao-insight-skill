@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Centralized Taobao/Tmall login detection and wait helpers."""
+"""Centralized JD login/risk detection and wait helpers."""
 
 from __future__ import annotations
 
@@ -7,24 +7,25 @@ import time
 from typing import Any
 
 
-LOGIN_COOKIE_NAMES = {"cookie2", "unb", "_tb_token_", "_m_h5_tk"}
-TAOBAO_COOKIE_URLS = [
-    "https://www.taobao.com",
-    "https://s.taobao.com",
-    "https://detail.tmall.com",
-    "https://www.tmall.com",
+LOGIN_COOKIE_NAMES = {"thor", "pin", "pinId", "TrackID", "unick"}
+JD_COOKIE_URLS = [
+    "https://www.jd.com",
+    "https://search.jd.com",
+    "https://item.jd.com",
 ]
 
 LOGIN_URL_TOKENS = (
-    "login.taobao.com",
-    "member/login",
+    "passport.jd.com",
+    "passport-login",
+    "new/login.aspx",
+    "uc.jd.com",
 )
 ANTI_BOT_URL_TOKENS = (
+    "risk_handler",
+    "jdr_shields",
     "captcha",
-    "punish",
-    "x5sec",
-    "_____tmd_____",
-    "nocaptcha",
+    "verifycode",
+    "slide",
 )
 
 
@@ -42,59 +43,51 @@ def _expand_markers(*tokens: str) -> tuple[str, ...]:
 
 LOGIN_MARKERS = _expand_markers(
     "\u626b\u7801\u767b\u5f55",
-    "\u8bf7\u626b\u7801\u767b\u5f55",
-    "\u626b\u4e00\u626b\u767b\u5f55",
-    "\u8d26\u53f7\u5bc6\u7801\u767b\u5f55",
+    "\u8bf7\u767b\u5f55",
+    "\u8d26\u53f7\u767b\u5f55",
+    "\u8d26\u6237\u767b\u5f55",
     "\u5bc6\u7801\u767b\u5f55",
     "\u77ed\u4fe1\u767b\u5f55",
     "\u624b\u673a\u9a8c\u8bc1\u7801\u767b\u5f55",
-    "\u5fd8\u8bb0\u5bc6\u7801",
-    "\u514d\u8d39\u6ce8\u518c",
-    "\u8bf7\u767b\u5f55",
-    "\u767b\u5f55\u6dd8\u5b9d",
-    "\u767b\u5f55\u5929\u732b",
-    "taobao login",
-    "tmall login",
+    "\u4eac\u4e1c\u767b\u5f55",
+    "jd login",
 )
 
 SEARCH_MARKERS = _expand_markers(
-    "\u4eba\u4ed8\u6b3e",
-    "\u5df2\u552e",
     "\u7efc\u5408\u6392\u5e8f",
     "\u9500\u91cf",
-    "\u7b5b\u9009",
-    "\u6536\u8d27\u5730",
-    "\u5e97\u94fa",
-    "\u4ef7\u683c",
-    "taobao",
-    "tmall",
+    "\u8bc4\u4ef7",
+    "\u81ea\u8425",
+    "\u65d7\u8230\u5e97",
+    "\u914d\u9001\u81f3",
+    "search.jd.com",
+    "\u4eac\u4e1c",
 )
 
 ANTI_BOT_MARKERS = _expand_markers(
-    "rgv587",
-    "fail_sys_user_validate",
-    "\u8bf7\u5b8c\u6210\u9a8c\u8bc1",
+    "\u4eac\u4e1c\u9a8c\u8bc1",
     "\u5b89\u5168\u9a8c\u8bc1",
+    "JDR_shields",
+    "risk_handler",
     "\u62d6\u52a8\u6ed1\u5757",
-    "x5sec",
-    "nocaptcha",
+    "\u8bf7\u5b8c\u6210\u5b89\u5168\u9a8c\u8bc1",
+    "ipaas-floor-app",
 )
 
 _LOGIN_TITLE_MARKERS = _expand_markers(
-    "\u626b\u7801\u767b\u5f55",
-    "\u8bf7\u767b\u5f55",
-    "\u767b\u5f55\u6dd8\u5b9d",
-    "\u767b\u5f55\u5929\u732b",
-    "\u6dd8\u5b9d\u767b\u5f55",
-    "\u5929\u732b\u767b\u5f55",
-    "taobao login",
-    "tmall login",
+    "\u767b\u5f55",
+    "\u4eac\u4e1c",
+)
+_CAPTCHA_TITLE_MARKERS = _expand_markers(
+    "\u9a8c\u8bc1",
+    "\u5b89\u5168",
+    "captcha",
 )
 
 # Pre-computed token sets used in decide_login_page hot path.
 _LOGIN_KEYWORD_MARKERS = _expand_markers("登录", "login")
 _QR_SCAN_MARKERS = _expand_markers("扫码", "登录")
-_PLEASE_LOGIN_MARKERS = _expand_markers("请登录")
+_JD_TITLE_LOGIN_MARKERS = _expand_markers("jd login", "京东登录")
 
 
 def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
@@ -105,15 +98,7 @@ def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
 
 def is_search_result_url(url: str) -> bool:
     lower = (url or "").lower()
-    if "s.taobao.com/search" in lower:
-        return True
-    if "s.taobao.com" in lower and ("q=" in lower or "search" in lower or "sort=" in lower):
-        return True
-    if "list.tmall.com/search_product.htm" in lower:
-        return True
-    if "list.tmall.com" in lower and "q=" in lower:
-        return True
-    return False
+    return "search.jd.com/search" in lower
 
 
 def looks_like_search_content(body_text: str) -> bool:
@@ -139,30 +124,24 @@ def detect_non_product_page(current_url: str, title: str, body_text: str) -> str
     url_lower = (current_url or "").lower()
     title_text = title or ""
     body = body_text or ""
-    body_lower = body.lower()
 
     if any(token in url_lower for token in LOGIN_URL_TOKENS):
-        return "redirected to Taobao login page"
+        return "redirected to JD login page"
     if any(token in url_lower for token in ANTI_BOT_URL_TOKENS):
-        return "redirected to anti-bot verification page"
+        return "redirected to JD anti-bot verification page"
     if _contains_any(body, ANTI_BOT_MARKERS) or _contains_any(title_text, ANTI_BOT_MARKERS):
-        return "anti-bot validation detected in response"
+        return "JD anti-bot validation detected"
 
     if is_search_result_url(url_lower):
-        has_item_link = (
-            "item.taobao.com/item.htm?id=" in body_lower
-            or "detail.tmall.com/item.htm?id=" in body_lower
-        )
+        has_item_link = "item.jd.com/" in body.lower()
         if has_item_link or looks_like_search_content(body):
             return ""
 
     login_hits = count_login_marker_hits(body, title_text)
     if login_hits >= 2:
-        return "login page content detected"
-    if _contains_any(title_text, _LOGIN_TITLE_MARKERS):
-        return "login page title detected"
-    if "captcha" in title_text.lower():
-        return "captcha title detected"
+        return "JD login page content detected"
+    if _contains_any(title_text, _LOGIN_TITLE_MARKERS) and _contains_any(title_text, _CAPTCHA_TITLE_MARKERS):
+        return "JD login page title detected"
     return ""
 
 
@@ -175,8 +154,8 @@ def decide_login_page(
     has_search_dom: bool,
 ) -> tuple[bool, str]:
     url_lower = (current_url or "").lower()
-    title_text = title or ""
     body = body_text or ""
+    title_text = title or ""
 
     if any(token in url_lower for token in LOGIN_URL_TOKENS):
         return True, "url_login"
@@ -197,12 +176,10 @@ def decide_login_page(
 
     if hits >= 2:
         return True, "content_login_markers"
-    if _contains_any(title_text, _LOGIN_TITLE_MARKERS):
+    if _contains_any(title_text, _JD_TITLE_LOGIN_MARKERS):
         return True, "title_login"
     if _contains_any(body, _QR_SCAN_MARKERS):
         return True, "qr_login_prompt"
-    if _contains_any(body, _PLEASE_LOGIN_MARKERS):
-        return True, "login_prompt"
     if has_login_cookie:
         return False, "cookie_present_non_login"
     return False, "non_login_default"

@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Global browser manager for Taobao workflows."""
+"""Global browser manager for marketplace workflows.
+
+Both Taobao and JD use the same browser strategy here:
+1. raw CDP first
+2. fallback to Playwright persistent context on CDP init failure
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,10 @@ from typing import Any, Optional
 from playwright.async_api import Playwright, async_playwright
 
 from tools import utils
+from tools.browser_hardening import (
+    build_persistent_context_kwargs,
+    default_stealth_script_path,
+)
 from tools.cdp_browser import CDPBrowserManager
 
 
@@ -27,6 +36,7 @@ class GlobalBrowserManager:
         self._headless = False
         self._initialized = False
         self._context_lock = asyncio.Lock()
+        self._config_signature: tuple[Any, ...] | None = None
 
     @classmethod
     async def get_instance(cls) -> "GlobalBrowserManager":
@@ -46,20 +56,10 @@ class GlobalBrowserManager:
         self.playwright = await async_playwright().start()
         profile = Path(user_data_dir).resolve()
         profile.mkdir(parents=True, exist_ok=True)
-        args = [
-            "--disable-blink-features=AutomationControlled",
-            "--exclude-switches=enable-automation",
-            "--disable-infobars",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-        ]
-        launch_kwargs = {
-            "headless": bool(headless),
-            "args": args,
-            "viewport": {"width": 1920, "height": 1080},
-            "channel": "chrome",
-            "user_agent": user_agent or None,
-        }
+        launch_kwargs = build_persistent_context_kwargs(
+            headless=headless,
+            user_agent=user_agent,
+        )
         try:
             context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=str(profile),
@@ -78,7 +78,7 @@ class GlobalBrowserManager:
                 user_data_dir=str(fallback),
                 **launch_kwargs,
             )
-        stealth = Path(__file__).parent.parent / "libs" / "stealth.min.js"
+        stealth = default_stealth_script_path()
         if stealth.exists():
             await context.add_init_script(path=str(stealth))
         return context
@@ -95,19 +95,28 @@ class GlobalBrowserManager:
         auto_close_browser: bool = False,
         user_agent: str = "",
     ) -> Any:
-        if self._initialized:
-            utils.logger.info("[GlobalBrowserManager] already initialized")
-            return self.browser_context
-
         async with self._lock:
-            if self._initialized:
-                utils.logger.info("[GlobalBrowserManager] already initialized (double-check)")
-                return self.browser_context
-
             self._headless = bool(headless)
             requested_mode = str(browser_mode or "cdp").strip().lower()
             if requested_mode not in {"cdp", "persistent"}:
                 requested_mode = "cdp"
+            resolved_user_data_dir = str(Path(user_data_dir).resolve())
+            requested_signature = (
+                requested_mode,
+                bool(headless),
+                resolved_user_data_dir,
+                str(cdp_url or "").strip(),
+                str(custom_browser_path or "").strip(),
+            )
+            if self._initialized:
+                if self._config_signature == requested_signature:
+                    utils.logger.info("[GlobalBrowserManager] already initialized (double-check)")
+                    return self.browser_context
+                utils.logger.info(
+                    "[GlobalBrowserManager] config changed, reinitializing browser context"
+                )
+                await self.cleanup()
+
             self._is_cdp_mode = (requested_mode == "cdp")
             utils.logger.info(
                 "[GlobalBrowserManager] initializing mode=%s headless=%s",
@@ -147,20 +156,21 @@ class GlobalBrowserManager:
                         self._is_cdp_mode = False
                         self.browser_context = await self._initialize_persistent_context(
                             headless=headless,
-                            user_data_dir=user_data_dir,
+                            user_data_dir=resolved_user_data_dir,
                             user_agent=user_agent,
                         )
                 else:
                     self._is_cdp_mode = False
                     self.browser_context = await self._initialize_persistent_context(
                         headless=headless,
-                        user_data_dir=user_data_dir,
+                        user_data_dir=resolved_user_data_dir,
                         user_agent=user_agent,
                     )
 
                 if self.browser_context is None:
                     raise RuntimeError("browser context is None")
                 self._initialized = True
+                self._config_signature = requested_signature
                 utils.logger.info(
                     "[GlobalBrowserManager] initialized pages=%s",
                     len(getattr(self.browser_context, "pages", []) or []),
@@ -227,10 +237,15 @@ class GlobalBrowserManager:
             self.playwright = None
 
         self._initialized = False
+        self._config_signature = None
 
     @property
     def is_initialized(self) -> bool:
         return self._initialized and self.browser_context is not None
+
+    @property
+    def current_mode(self) -> str:
+        return "cdp" if self._is_cdp_mode else "persistent"
 
 
 _global_manager: Optional[GlobalBrowserManager] = None
@@ -238,8 +253,9 @@ _global_manager: Optional[GlobalBrowserManager] = None
 
 async def get_global_browser_manager() -> GlobalBrowserManager:
     global _global_manager
+    instance = await GlobalBrowserManager.get_instance()
     if _global_manager is None:
-        _global_manager = await GlobalBrowserManager.get_instance()
+        _global_manager = instance
     return _global_manager
 
 

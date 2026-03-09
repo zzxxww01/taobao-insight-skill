@@ -11,7 +11,7 @@ import re
 import shutil
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape as html_escape, unescape as html_unescape
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,9 @@ from config import (
     ITEM_ID_IN_TEXT_RE,
     ITEM_ID_RE,
     ITEM_URL_RE,
+    JD_DOMAINS,
+    JD_HINT_RE,
+    JD_ITEM_URL_RE,
     JSON_ITEM_ID_RE,
     LOGIN_COOKIE_NAMES,
     OFFICIAL_SHOP_MARKER_RE,
@@ -53,6 +56,7 @@ class UrlRecord:
     normalized_url: str
     item_id: str
     sku_id: str | None
+    platform: str = "taobao"
     item_source_url: str = ""
     source_type: str = "official"
     search_rank: int | None = None
@@ -76,11 +80,52 @@ class ItemDetail:
     detail_blocks: list[dict[str, str]]
     citations: list[str]
     crawl_time: str
+    platform: str = "taobao"
+    visit_chain: list[dict[str, str]] = field(default_factory=list)
     error: str = ""
 
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# Shared path / slug utilities used by both pipeline.py and review_export.py.
+# ---------------------------------------------------------------------------
+
+def _source_mode_dirname(source_mode: str) -> str:
+    return "direct" if str(source_mode or "").strip().lower() == "input_urls" else "search"
+
+
+def artifact_scope_dir(base_dir: str | Path, platform: str, source_mode: str) -> Path:
+    platform_name = str(platform or "taobao").strip().lower() or "taobao"
+    return Path(base_dir) / platform_name / _source_mode_dirname(source_mode)
+
+
+def safe_path_slug(value: str, *, default: str = "item", lowercase: bool = True) -> str:
+    """Return a filesystem-safe ASCII slug from *value*.
+
+    Non-ASCII characters are encoded as ``uXXXX``.  The *lowercase* flag
+    controls whether ASCII letters are folded to lower case (useful for
+    keyword-based directory names).  *default* is returned when the result
+    would otherwise be empty.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    _sep_chars = set(" \t\n\r/\\:+")
+    chunks: list[str] = []
+    for ch in raw:
+        if re.match(r"[0-9A-Za-z._-]", ch):
+            chunks.append(ch.lower() if lowercase else ch)
+            continue
+        if ch in _sep_chars:
+            chunks.append("-")
+            continue
+        chunks.append(f"u{ord(ch):x}")
+    text = "".join(chunks)
+    text = re.sub(r"-{2,}", "-", text).strip("-._")
+    return text or default
 
 
 def clean_text(value: str, max_len: int = 300) -> str:
@@ -302,6 +347,17 @@ def looks_like_tmall(url_text: str) -> bool:
     return "tmall.com" in host or "tmall.hk" in host
 
 
+def looks_like_jd(url_text: str) -> bool:
+    text = (url_text or "").strip()
+    if not text:
+        return False
+    if JD_HINT_RE.search(text):
+        return True
+    parsed = urlparse(text)
+    host = (parsed.netloc or "").lower()
+    return any(domain in host for domain in JD_DOMAINS)
+
+
 def _pick_query_value(
     query_pairs: list[tuple[str, str]], aliases: set[str]
 ) -> str | None:
@@ -319,8 +375,17 @@ def _build_rich_item_url(
         scheme = "https"
     host = "detail.tmall.com" if is_tmall else "item.taobao.com"
     path = "/item.htm"
+    original_host = (parsed.netloc or "").lower()
+    preserve_context = original_host in {
+        "detail.tmall.com",
+        "item.taobao.com",
+    }
+    keep_keys = {"id", "skuid", "sku_id"}
+    if preserve_context and is_tmall:
+        keep_keys.update({"abbucket", "rn", "spm", "pisk"})
+    elif preserve_context:
+        keep_keys.update({"spm"})
 
-    # Keep existing query params to preserve detail-page options/context flags.
     original_pairs = parse_qsl(parsed.query, keep_blank_values=True)
     merged_pairs: list[tuple[str, str]] = []
     id_written = False
@@ -340,6 +405,8 @@ def _build_rich_item_url(
                 merged_pairs.append(("skuId", sku_id))
                 sku_written = True
             continue
+        if key_lower not in keep_keys:
+            continue
         merged_pairs.append((key_clean, (value or "").strip()))
 
     if not id_written:
@@ -354,16 +421,43 @@ def _build_rich_item_url(
     return f"{scheme}://{host}{path}?id={item_id}"
 
 
-def normalize_url(raw_url: str) -> UrlRecord | None:
+def _build_jd_item_url(parsed: Any, item_id: str) -> str:
+    scheme = (parsed.scheme or "https").lower()
+    if scheme not in {"http", "https"}:
+        scheme = "https"
+    return f"{scheme}://item.jd.com/{item_id}.html"
+
+
+def normalize_url(
+    raw_url: str,
+    *,
+    default_platform: str = "taobao",
+    allowed_platforms: set[str] | None = None,
+) -> UrlRecord | None:
     raw = (raw_url or "").strip()
     if not raw:
         return None
     if DIGITS_ONLY_RE.match(raw):
+        platform = default_platform if default_platform in {"taobao", "jd"} else "taobao"
+        if allowed_platforms and platform not in allowed_platforms:
+            return None
+        if platform == "jd":
+            normalized_jd = f"https://item.jd.com/{raw}.html"
+            return UrlRecord(
+                raw_url=raw_url,
+                normalized_url=normalized_jd,
+                item_id=raw,
+                sku_id=None,
+                platform="jd",
+                item_source_url=normalized_jd,
+                source_type="official",
+            )
         return UrlRecord(
             raw_url=raw_url,
             normalized_url=f"https://item.taobao.com/item.htm?id={raw}",
             item_id=raw,
             sku_id=None,
+            platform="taobao",
             item_source_url=f"https://item.taobao.com/item.htm?id={raw}",
             source_type="official",
         )
@@ -371,7 +465,11 @@ def normalize_url(raw_url: str) -> UrlRecord | None:
         raw = "https:" + raw
     elif not raw.lower().startswith("http"):
         host_hint = raw.lower()
-        if "item.taobao.com" in host_hint or "detail.tmall.com" in host_hint:
+        if (
+            "item.taobao.com" in host_hint
+            or "detail.tmall.com" in host_hint
+            or "item.jd.com" in host_hint
+        ):
             raw = "https://" + raw.lstrip("/")
         else:
             return None
@@ -385,8 +483,9 @@ def normalize_url(raw_url: str) -> UrlRecord | None:
         or (query.get("skuId") or query.get("skuid") or [None])[0]
     )
     is_tmall = looks_like_tmall(raw)
+    is_jd = looks_like_jd(raw)
 
-    if not is_tmall:
+    if not is_tmall and not is_jd:
         for key in (
             "url",
             "target",
@@ -400,8 +499,18 @@ def normalize_url(raw_url: str) -> UrlRecord | None:
                 if looks_like_tmall(maybe_url):
                     is_tmall = True
                     break
+                if looks_like_jd(maybe_url):
+                    is_jd = True
+                    break
             if is_tmall:
                 break
+            if is_jd:
+                break
+
+    if is_jd and not item_id:
+        jd_match = JD_ITEM_URL_RE.search(raw)
+        if jd_match:
+            item_id = jd_match.group("id")
 
     if not item_id:
         match = ITEM_ID_RE.search(raw)
@@ -415,19 +524,30 @@ def normalize_url(raw_url: str) -> UrlRecord | None:
     if not item_id:
         decoded = unquote(raw)
         if decoded != raw:
-            return normalize_url(decoded)
+            return normalize_url(
+                decoded,
+                default_platform=default_platform,
+                allowed_platforms=allowed_platforms,
+            )
         return None
     if not item_id.isdigit() or len(item_id) < 6:
         return None
 
-    normalized = _build_rich_item_url(
-        parsed=parsed, is_tmall=is_tmall, item_id=item_id, sku_id=sku_id
-    )
+    platform = "jd" if is_jd else "taobao"
+    if allowed_platforms and platform not in allowed_platforms:
+        return None
+    if platform == "jd":
+        normalized = _build_jd_item_url(parsed=parsed, item_id=item_id)
+    else:
+        normalized = _build_rich_item_url(
+            parsed=parsed, is_tmall=is_tmall, item_id=item_id, sku_id=sku_id
+        )
     return UrlRecord(
         raw_url=raw_url,
         normalized_url=normalized,
         item_id=item_id,
         sku_id=sku_id,
+        platform=platform,
         item_source_url=normalized,
         source_type="official",
     )
@@ -497,7 +617,13 @@ def is_official_shop(shop_name: str, card_text: str = "") -> bool:
     return False
 
 
-def extract_candidate_item_urls(text: str, limit: int = 300) -> list[str]:
+def extract_candidate_item_urls(
+    text: str,
+    limit: int = 300,
+    *,
+    default_platform: str = "taobao",
+    allowed_platforms: set[str] | None = None,
+) -> list[str]:
     if not text:
         return []
 
@@ -517,7 +643,11 @@ def extract_candidate_item_urls(text: str, limit: int = 300) -> list[str]:
     def push_url(raw_url: str) -> None:
         if len(candidates) >= limit:
             return
-        rec = normalize_url(raw_url)
+        rec = normalize_url(
+            raw_url,
+            default_platform=default_platform,
+            allowed_platforms=allowed_platforms,
+        )
         if not rec or rec.item_id in seen_item_ids:
             return
         seen_item_ids.add(rec.item_id)
@@ -529,11 +659,19 @@ def extract_candidate_item_urls(text: str, limit: int = 300) -> list[str]:
         if not item_id or item_id in seen_item_ids:
             return
         seen_item_ids.add(item_id)
-        candidates.append(f"https://item.taobao.com/item.htm?id={item_id}")
+        if default_platform == "jd":
+            candidates.append(f"https://item.jd.com/{item_id}.html")
+        else:
+            candidates.append(f"https://item.taobao.com/item.htm?id={item_id}")
 
     for body in variants:
         for raw_url in ITEM_URL_RE.findall(body):
             push_url(raw_url)
+            if len(candidates) >= limit:
+                return candidates
+
+        for match in JD_ITEM_URL_RE.finditer(body):
+            push_url(match.group(0))
             if len(candidates) >= limit:
                 return candidates
 
@@ -903,6 +1041,9 @@ class URLService:
         workbook_id: str,
         raw_urls: list[str],
         group_code: str = DEFAULT_GROUP_CODE,
+        *,
+        default_platform: str = "taobao",
+        allowed_platforms: set[str] | None = None,
     ) -> list[dict[str, str]]:
         workbook = self.workbook_service.get(workbook_id)
         group_map = {
@@ -915,7 +1056,11 @@ class URLService:
         changed: list[dict[str, str]] = []
 
         for raw in raw_urls:
-            rec = normalize_url(raw)
+            rec = normalize_url(
+                raw,
+                default_platform=default_platform,
+                allowed_platforms=allowed_platforms,
+            )
             if not rec:
                 continue
             existing = next(
@@ -952,6 +1097,7 @@ class URLService:
                 "final_conclusion_text": "",
                 "market_tags": "",
                 "crawl_time": "",
+                "platform": rec.platform,
                 "search_rank": "",
                 "sales_text": "",
                 "official_store": "",
@@ -1031,6 +1177,7 @@ class URLService:
                 "final_conclusion_text": "",
                 "market_tags": "",
                 "crawl_time": "",
+                "platform": rec.platform,
                 "search_rank": (
                     str(rec.search_rank) if rec.search_rank is not None else ""
                 ),

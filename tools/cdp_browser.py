@@ -12,11 +12,13 @@ pattern used by the baoyu skill browser flow:
 from __future__ import annotations
 
 import asyncio
+import ast
 import atexit
 import base64
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -25,6 +27,13 @@ from typing import Any, Callable, Dict, Optional
 
 import httpx
 
+from tools.browser_hardening import (
+    DEFAULT_ACCEPT_LANGUAGE,
+    DEFAULT_LOCALE,
+    DEFAULT_TIMEZONE_ID,
+    build_browser_launch_args,
+    load_stealth_script_source,
+)
 from tools import utils
 
 
@@ -245,6 +254,14 @@ class CdpConnection:
         handlers = self._event_handlers.setdefault(method, set())
         handlers.add(handler)
 
+    def off(self, method: str, handler: Callable[[dict[str, Any]], None]) -> None:
+        handlers = self._event_handlers.get(method)
+        if not handlers:
+            return
+        handlers.discard(handler)
+        if not handlers:
+            self._event_handlers.pop(method, None)
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -280,31 +297,263 @@ class _RawCdpMouse:
         await self._page.evaluate(f"window.scrollBy(0, {int(delta_y)}); true")
 
 
+def _parse_has_text_selector(selector: str) -> tuple[str, str] | None:
+    matched = re.match(
+        r"^(?P<base>.*?):has-text\((?P<literal>'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\")\)\s*$",
+        str(selector or "").strip(),
+    )
+    if not matched:
+        return None
+    base_selector = str(matched.group("base") or "").strip() or "*"
+    try:
+        text_value = ast.literal_eval(matched.group("literal"))
+    except Exception:
+        return None
+    return base_selector, str(text_value or "")
+
+
+def _build_node_lookup_expression(
+    *,
+    selector: str = "",
+    text: str = "",
+    exact: bool = False,
+) -> str:
+    if text:
+        label_json = json.dumps(text, ensure_ascii=False)
+        exact_json = "true" if exact else "false"
+        return f"""
+(() => {{
+  const label = {label_json};
+  const exact = {exact_json};
+  const clickableSelector = 'a,button,[role="tab"],[role="link"],[role="button"],[onclick],label';
+  const poolSelector = 'a,button,[role="tab"],[role="link"],[role="button"],[onclick],li,span,div,p,label';
+  const isVisible = (node) => {{
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  const nodes = Array.from(document.querySelectorAll(poolSelector));
+  const candidates = [];
+  for (const node of nodes) {{
+    const textValue = String(node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!textValue) continue;
+    if (exact ? textValue !== label : !textValue.includes(label)) continue;
+    if (!isVisible(node)) continue;
+    const clickable = node.closest ? (node.closest(clickableSelector) || node) : node;
+    candidates.push({{
+      target: clickable,
+      exact: textValue === label ? 1 : 0,
+      short: textValue.length <= Math.max(20, label.length + 10) ? 1 : 0,
+      direct: clickable === node ? 1 : 0,
+      length: textValue.length,
+    }});
+  }}
+  candidates.sort((left, right) => {{
+    if (left.exact !== right.exact) return right.exact - left.exact;
+    if (left.short !== right.short) return right.short - left.short;
+    if (left.direct !== right.direct) return right.direct - left.direct;
+    return left.length - right.length;
+  }});
+  return candidates.length ? candidates[0].target : null;
+}})()
+"""
+
+    has_text_selector = _parse_has_text_selector(selector)
+    if has_text_selector is not None:
+        base_selector, text_value = has_text_selector
+        base_selector_json = json.dumps(base_selector, ensure_ascii=False)
+        label_json = json.dumps(text_value, ensure_ascii=False)
+        return f"""
+(() => {{
+  const baseSelector = {base_selector_json};
+  const label = {label_json};
+  const clickableSelector = 'a,button,[role="tab"],[role="link"],[role="button"],[onclick],label';
+  const isVisible = (node) => {{
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  let nodes = [];
+  try {{
+    nodes = Array.from(document.querySelectorAll(baseSelector));
+  }} catch (error) {{
+    return null;
+  }}
+  const candidates = [];
+  for (const node of nodes) {{
+    const textValue = String(node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!textValue || !textValue.includes(label) || !isVisible(node)) continue;
+    const clickable = node.closest ? (node.closest(clickableSelector) || node) : node;
+    candidates.push({{
+      target: clickable,
+      short: textValue.length <= Math.max(20, label.length + 10) ? 1 : 0,
+      direct: clickable === node ? 1 : 0,
+      length: textValue.length,
+    }});
+  }}
+  candidates.sort((left, right) => {{
+    if (left.short !== right.short) return right.short - left.short;
+    if (left.direct !== right.direct) return right.direct - left.direct;
+    return left.length - right.length;
+  }});
+  return candidates.length ? candidates[0].target : null;
+}})()
+"""
+
+    selector_value = str(selector or "").strip()
+    if selector_value.startswith("text="):
+        return _build_node_lookup_expression(text=selector_value[5:], exact=False)
+
+    selector_json = json.dumps(selector_value, ensure_ascii=False)
+    return f"""
+(() => {{
+  try {{
+    return document.querySelector({selector_json});
+  }} catch (error) {{
+    return null;
+  }}
+}})()
+"""
+
+
 class _RawCdpLocator:
-    def __init__(self, page: "RawCdpPage", selector: str):
+    def __init__(
+        self,
+        page: "RawCdpPage",
+        selector: str = "",
+        *,
+        text: str = "",
+        exact: bool = False,
+    ):
         self._page = page
         self._selector = selector
+        self._text = text
+        self._exact = bool(exact)
 
     @property
     def first(self) -> "_RawCdpLocator":
         return self
 
-    async def click(self, timeout: int = 1500) -> None:
-        _ = timeout
-        selector_json = json.dumps(self._selector, ensure_ascii=False)
-        ok = await self._page.evaluate(
-            f"""
+    def _node_lookup_expression(self) -> str:
+        return _build_node_lookup_expression(
+            selector=self._selector,
+            text=self._text,
+            exact=self._exact,
+        )
+
+    async def _run_on_node(
+        self,
+        action_body: str,
+        *,
+        timeout: int = 1500,
+    ) -> Any:
+        deadline = asyncio.get_running_loop().time() + max(0.2, float(timeout) / 1000.0)
+        lookup = self._node_lookup_expression()
+        last_error: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                result = await self._page.evaluate(
+                    f"""
 (() => {{
-  const node = document.querySelector({selector_json});
-  if (!node) return false;
-  node.scrollIntoView({{block: "center", inline: "center"}});
-  if (typeof node.click === "function") node.click();
-  return true;
+  const node = {lookup};
+  if (!node) return {{ found: false }};
+  {action_body}
 }})()
 """
+                )
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.05)
+                continue
+            if isinstance(result, dict) and result.get("found"):
+                return result.get("value")
+            await asyncio.sleep(0.05)
+
+        target = self._text or self._selector or "<unknown>"
+        if last_error is not None:
+            raise RuntimeError(f"locator action failed for {target}: {last_error}")
+        raise RuntimeError(f"locator node not found: {target}")
+
+    async def click(self, timeout: int = 1500) -> None:
+        await self._run_on_node(
+            """
+  node.scrollIntoView({ block: "center", inline: "center" });
+  if (typeof node.click === "function") node.click();
+  return { found: true, value: true };
+""",
+            timeout=timeout,
         )
-        if not ok:
-            raise RuntimeError(f"locator click failed: {self._selector}")
+
+    async def evaluate(self, expression: str, timeout: int = 1500) -> Any:
+        expression_json = json.dumps(str(expression or ""), ensure_ascii=False)
+        return await self._run_on_node(
+            f"""
+  const source = {expression_json};
+  const fn = eval(source);
+  return {{ found: true, value: fn(node) }};
+""",
+            timeout=timeout,
+        )
+
+    async def get_attribute(self, name: str, timeout: int = 1500) -> Any:
+        name_json = json.dumps(str(name or ""), ensure_ascii=False)
+        return await self._run_on_node(
+            f"""
+  return {{ found: true, value: node.getAttribute({name_json}) }};
+""",
+            timeout=timeout,
+        )
+
+    async def scroll_into_view_if_needed(self, timeout: int = 1500) -> None:
+        await self._run_on_node(
+            """
+  node.scrollIntoView({ block: "center", inline: "center" });
+  return { found: true, value: true };
+""",
+            timeout=timeout,
+        )
+
+
+class _RawCdpResponse:
+    def __init__(
+        self,
+        *,
+        page: "RawCdpPage",
+        request_id: str,
+        response_url: str,
+        status: int = 0,
+    ):
+        self._page = page
+        self._request_id = str(request_id or "")
+        self.url = str(response_url or "")
+        self.status = int(status or 0)
+
+    async def text(self) -> str:
+        if not self._request_id:
+            return ""
+        last_error: Exception | None = None
+        for _ in range(6):
+            try:
+                payload = await self._page.conn.send(
+                    "Network.getResponseBody",
+                    {"requestId": self._request_id},
+                    session_id=self._page.session_id,
+                    timeout_sec=10.0,
+                )
+                text = str(payload.get("body", "") or "")
+                if payload.get("base64Encoded"):
+                    return base64.b64decode(text).decode("utf-8", errors="replace")
+                return text
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.2)
+        if last_error is not None:
+            raise last_error
+        return ""
 
 
 class RawCdpPage:
@@ -323,18 +572,44 @@ class RawCdpPage:
         self._closed = False
         self._last_url = ""
         self.mouse = _RawCdpMouse(self)
+        self._page_event_handlers: dict[str, set[Callable[..., Any]]] = {}
+        self._network_response_handler_registered = False
 
     async def initialize(self, user_agent: str = "") -> None:
         await self.conn.send("Page.enable", session_id=self.session_id)
         await self.conn.send("Runtime.enable", session_id=self.session_id)
         await self.conn.send("DOM.enable", session_id=self.session_id)
         await self.conn.send("Network.enable", session_id=self.session_id)
-        if user_agent:
+        try:
             await self.conn.send(
-                "Network.setUserAgentOverride",
-                {"userAgent": user_agent},
+                "Network.setExtraHTTPHeaders",
+                {"headers": {"Accept-Language": DEFAULT_ACCEPT_LANGUAGE}},
                 session_id=self.session_id,
             )
+        except Exception:
+            pass
+        if user_agent:
+            params = {
+                "userAgent": user_agent,
+                "acceptLanguage": DEFAULT_ACCEPT_LANGUAGE,
+                "platform": "Windows",
+            }
+            try:
+                await self.conn.send(
+                    "Network.setUserAgentOverride",
+                    params,
+                    session_id=self.session_id,
+                )
+            except Exception:
+                pass
+        for method, params in (
+            ("Emulation.setLocaleOverride", {"locale": DEFAULT_LOCALE}),
+            ("Emulation.setTimezoneOverride", {"timezoneId": DEFAULT_TIMEZONE_ID}),
+        ):
+            try:
+                await self.conn.send(method, params, session_id=self.session_id)
+            except Exception:
+                continue
         if self.manager._stealth_script_source:
             await self.conn.send(
                 "Page.addScriptToEvaluateOnNewDocument",
@@ -358,10 +633,38 @@ class RawCdpPage:
     def locator(self, selector: str) -> _RawCdpLocator:
         return _RawCdpLocator(self, selector)
 
+    def get_by_text(self, text: str, exact: bool = False) -> _RawCdpLocator:
+        return _RawCdpLocator(self, text=text, exact=exact)
+
     def on(self, event: str, callback: Callable[..., Any]) -> None:
-        # Raw CDP response-event wiring is intentionally omitted for now.
-        _ = event
-        _ = callback
+        handlers = self._page_event_handlers.setdefault(str(event or ""), set())
+        handlers.add(callback)
+        if event == "response" and not self._network_response_handler_registered:
+            self.conn.on("Network.responseReceived", self._dispatch_network_response)
+            self._network_response_handler_registered = True
+
+    def _dispatch_network_response(self, msg: dict[str, Any]) -> None:
+        if self._closed:
+            return
+        if str(msg.get("sessionId", "") or "") != self.session_id:
+            return
+        handlers = self._page_event_handlers.get("response", set())
+        if not handlers:
+            return
+        params = dict(msg.get("params", {}) or {})
+        request_id = str(params.get("requestId", "") or "")
+        response = dict(params.get("response", {}) or {})
+        response_event = _RawCdpResponse(
+            page=self,
+            request_id=request_id,
+            response_url=str(response.get("url", "") or ""),
+            status=int(response.get("status", 0) or 0),
+        )
+        for handler in list(handlers):
+            try:
+                handler(response_event)
+            except Exception:
+                continue
 
     async def _sync_url(self) -> None:
         try:
@@ -530,6 +833,12 @@ class RawCdpPage:
         if self._closed:
             return
         self._closed = True
+        if self._network_response_handler_registered:
+            try:
+                self.conn.off("Network.responseReceived", self._dispatch_network_response)
+            except Exception:
+                pass
+            self._network_response_handler_registered = False
         try:
             await self.conn.send("Target.closeTarget", {"targetId": self.target_id})
         except Exception:
@@ -704,15 +1013,10 @@ class CDPBrowserManager:
         args = [
             browser_path,
             f"--remote-debugging-port={self.debug_port}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-blink-features=AutomationControlled",
-            "--start-maximized",
         ]
+        args.extend(build_browser_launch_args(headless=headless))
         if user_data_dir:
             args.append(f"--user-data-dir={user_data_dir}")
-        if headless:
-            args.extend(["--headless=new", "--disable-gpu"])
 
         utils.logger.info("[CDPBrowserManager] launching browser path=%s", browser_path)
         utils.logger.info("[CDPBrowserManager] debug_port=%s safe_mode=%s", self.debug_port, self.safe_mode)
@@ -789,7 +1093,7 @@ class CDPBrowserManager:
             await self._connect_browser_level()
             self.browser_context = RawCdpContext(manager=self)
             first_page = await self._create_page(
-                url="https://www.taobao.com",
+                url="about:blank",
                 user_agent=user_agent or "",
             )
             self.browser_context.pages.append(first_page)
@@ -801,13 +1105,10 @@ class CDPBrowserManager:
             raise
 
     async def add_stealth_script(self, script_path: str = "") -> None:
-        if not script_path:
-            script_path = os.path.join(os.path.dirname(__file__), "..", "libs", "stealth.min.js")
-        path_obj = Path(script_path).resolve()
-        if not path_obj.exists():
+        self._stealth_script_source = load_stealth_script_source(script_path)
+        if not self._stealth_script_source:
             return
         try:
-            self._stealth_script_source = path_obj.read_text(encoding="utf-8", errors="ignore")
             if self.browser_context:
                 for page in self.browser_context.pages:
                     if page.is_closed():

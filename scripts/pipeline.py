@@ -13,10 +13,12 @@ import traceback
 import uuid
 import json
 import time
+import warnings
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote_plus
 import datetime as dt
 
 from config import (
@@ -35,12 +37,14 @@ from data import (
     UrlRecord,
     URLService,
     WorkbookService,
+    artifact_scope_dir,
     clean_text,
     extract_json_object,
     normalize_url,
     normalize_brand_name,
     now_iso,
     preserve_multiline_text,
+    safe_path_slug,
 )
 from scraper import (
     Crawler,
@@ -48,6 +52,7 @@ from scraper import (
     list_cdp_pages,
     load_url_lines,
 )
+from jd_scraper import JDSearchClient, JDCrawler
 from analysis import (
     Analyzer,
     SellingPointExtractor,
@@ -55,19 +60,101 @@ from analysis import (
 from report import ReportGenerator
 
 LOG = logging.getLogger("taobao_insight")
+warnings.filterwarnings("ignore", category=ResourceWarning)
+
+try:
+    from pypinyin import lazy_pinyin
+except Exception:  # pragma: no cover
+    lazy_pinyin = None
 
 
-def _default_user_data_dir() -> str:
+def _default_user_data_dir(platform: str = "taobao") -> str:
     from pathlib import Path
 
+    profile_name = "jd_insight_profile" if platform == "jd" else "taobao_insight_profile"
     appdata = os.getenv("APPDATA", "")
     if appdata:
-        return str(Path(appdata) / "taobao_insight_profile")
+        return str(Path(appdata) / profile_name)
     if sys.platform == "darwin":
         return str(
-            Path.home() / "Library" / "Application Support" / "taobao_insight_profile"
+            Path.home() / "Library" / "Application Support" / profile_name
         )
-    return str(Path.home() / ".config" / "taobao_insight_profile")
+    return str(Path.home() / ".config" / profile_name)
+
+
+def _safe_debug_slug(value: str) -> str:
+    """Like safe_path_slug but also romanizes CJK via pypinyin when available."""
+    if lazy_pinyin is None:
+        return safe_path_slug(value, default="debug")
+    raw = str(value or "").strip()
+    if not raw:
+        return "debug"
+    _sep_chars = set(" \t\n\r/\\:+")
+    chunks: list[str] = []
+    for ch in raw:
+        if re.match(r"[0-9A-Za-z._-]", ch):
+            chunks.append(ch.lower())
+            continue
+        if ch in _sep_chars:
+            chunks.append("-")
+            continue
+        romanized = "".join(
+            piece for piece in lazy_pinyin(ch) if re.match(r"[a-zA-Z0-9]+", piece or "")
+        )
+        if romanized:
+            chunks.append(romanized.lower())
+            continue
+        chunks.append(f"u{ord(ch):x}")
+    text = "".join(chunks)
+    text = re.sub(r"-{2,}", "-", text).strip("-._")
+    return text or "debug"
+
+
+def _platform_suffix(platform: str) -> str:
+    return "jd" if str(platform or "").strip().lower() == "jd" else "tb"
+
+
+def _default_run_basename(keyword: str, top_n: int, platform: str, source_mode: str) -> str:
+    date_part = dt.datetime.now().strftime("%y%m%d")
+    platform_part = _platform_suffix(platform)
+    if str(source_mode or "").strip().lower() == "input_urls":
+        return f"direct_{date_part}_{platform_part}"
+    keyword_part = _safe_debug_slug(keyword).replace("-", "_")
+    keyword_part = re.sub(r"_+", "_", keyword_part).strip("_") or "keyword"
+    return f"{keyword_part}_{date_part}_top{int(top_n)}_{platform_part}"
+
+
+def _default_search_url(platform: str, keyword: str) -> str:
+    normalized_platform = str(platform or "taobao").strip().lower()
+    if normalized_platform == "jd":
+        return f"https://search.jd.com/Search?keyword={quote_plus(keyword)}"
+    return f"https://s.taobao.com/search?q={quote_plus(keyword)}"
+
+
+def _default_debug_bundle_dir(
+    data_dir: str | Path,
+    platform: str,
+    keyword: str,
+    top_n: int,
+    source_mode: str = "keyword_search",
+) -> Path:
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = _safe_debug_slug(keyword)
+    scope_dir = artifact_scope_dir(Path(data_dir) / "debug_runs", platform, source_mode)
+    return scope_dir / f"{slug}-top{top_n}-{stamp}"
+
+
+def _add_debug_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--debug-mode",
+        action="store_true",
+        help="Capture Gemini inputs/outputs and build a debug bundle for this run.",
+    )
+    parser.add_argument(
+        "--debug-bundle-dir",
+        default="",
+        help="Optional output directory for the debug bundle.",
+    )
 
 
 class Pipeline:
@@ -82,6 +169,7 @@ class Pipeline:
         extractor: SellingPointExtractor,
         analyzer: Analyzer,
         task_tracker: TaskTracker,
+        platform: str = "taobao",
     ) -> None:
         self.storage = storage
         self.workbook_service = workbook_service
@@ -92,6 +180,7 @@ class Pipeline:
         self.extractor = extractor
         self.analyzer = analyzer
         self.task_tracker = task_tracker
+        self.platform = str(platform or "taobao").strip().lower()
         self.reporter = ReportGenerator(storage, workbook_service, analyzer)
 
     @staticmethod
@@ -170,16 +259,16 @@ class Pipeline:
     def _elapsed_seconds(started_at: float) -> float:
         return max(0.0, time.perf_counter() - started_at)
 
-    @staticmethod
-    def _effective_crawl_workers(requested_workers: int) -> int:
+    def _effective_crawl_workers(self, requested_workers: int) -> int:
         try:
             requested = max(1, int(requested_workers))
         except (TypeError, ValueError):
             requested = CRAWL_WORKERS
         if requested > CRAWL_WORKERS:
             LOG.warning(
-                "crawl_workers=%s configured; higher Taobao concurrency may increase anti-bot risk",
+                "crawl_workers=%s configured; higher %s concurrency may increase anti-bot risk",
                 requested,
+                self.platform,
             )
         return requested
 
@@ -244,12 +333,41 @@ class Pipeline:
         row["updated_at"] = now_iso()
 
     def _extract_points_for_detail(
-        self, detail: ItemDetail
+        self,
+        detail: ItemDetail,
+        *,
+        workbook_id: str = "",
+        task_id: str = "",
     ) -> tuple[str, list[dict[str, str]]]:
+        price_text = ""
+        if detail.prices:
+            low = min(detail.prices)
+            high = max(detail.prices)
+            price_text = f"{low:.2f}" if abs(low - high) < 0.01 else f"{low:.2f}-{high:.2f}"
+        sku_labels: list[str] = []
+        for sku in detail.skus[:4]:
+            sku_name = clean_text(str(sku.get("sku_name", "")), max_len=40)
+            sku_price = clean_text(str(sku.get("price", "")), max_len=20)
+            if sku_name and sku_price:
+                sku_labels.append(f"{sku_name}:{sku_price}")
+            elif sku_name:
+                sku_labels.append(sku_name)
+        sku_summary = " | ".join(sku_labels)
+        if detail.skus:
+            if sku_summary and len(detail.skus) > len(sku_labels):
+                sku_summary = f"{len(detail.skus)}个SKU；示例：{sku_summary}"
+            elif not sku_summary:
+                sku_summary = f"{len(detail.skus)}个SKU"
         item_context = {
+            "item_id": detail.item_id,
             "title": detail.title,
             "brand": detail.brand,
             "shop_name": detail.shop_name,
+            "platform": detail.platform,
+            "workbook_id": workbook_id,
+            "task_id": task_id,
+            "price_text": price_text,
+            "sku_summary": sku_summary,
         }
         detail_summary = self.extractor.summarize_detail(
             item_context=item_context,
@@ -319,6 +437,30 @@ class Pipeline:
         slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", (text or "").strip()).strip("-_")
         return slug or fallback
 
+    def _default_export_stem(self, workbook_name: str, source_mode: str) -> Path:
+        slug = _safe_debug_slug(workbook_name)
+        scope_dir = artifact_scope_dir(self.storage.exports_dir, self.platform, source_mode)
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        return scope_dir / slug
+
+    def _next_default_workbook_name(self, keyword: str, top_n: int, source_mode: str) -> str:
+        scope_dir = artifact_scope_dir(self.storage.exports_dir, self.platform, source_mode)
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        base = _default_run_basename(keyword, top_n, self.platform, source_mode)
+        candidate = base
+        version = 0
+        while True:
+            stem = scope_dir / candidate
+            occupied = (
+                stem.with_suffix(".md").exists()
+                or stem.with_suffix(".html").exists()
+                or (scope_dir / f"{candidate}-run-summary.md").exists()
+            )
+            if not occupied:
+                return candidate
+            version += 1
+            candidate = f"{base}_{version}"
+
     def _write_run_summary(
         self,
         *,
@@ -328,6 +470,7 @@ class Pipeline:
         keyword: str,
         status: str,
         result_payload: dict[str, Any] | None,
+        source_mode: str = "keyword_search",
         error_text: str = "",
         run_log_path: Path | None = None,
     ) -> tuple[dict[str, Any], Path]:
@@ -385,7 +528,9 @@ class Pipeline:
                 continue
 
         slug = self._safe_slug(workbook_name, task_id)
-        summary_path = self.storage.exports_dir / f"{slug}-run-summary.md"
+        summary_dir = artifact_scope_dir(self.storage.exports_dir, self.platform, source_mode)
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = summary_dir / f"{slug}-run-summary.md"
         lines = [
             "# 运行总结",
             "",
@@ -505,6 +650,8 @@ class Pipeline:
         workbook_name: str,
         workbook_rows: list[dict[str, str]],
         workbook_points_map: dict[str, list[dict[str, Any]]],
+        *,
+        task_id: str = "",
     ) -> tuple[dict[str, Any], str, str, str]:
         batch_summary_payload: dict[str, Any] = {}
         market: dict[str, Any] = {}
@@ -512,7 +659,10 @@ class Pipeline:
 
         try:
             batch_summary_payload = self.analyzer.generate_batch_competitor_summary(
-                workbook_rows, workbook_points_map
+                workbook_rows,
+                workbook_points_map,
+                workbook_id=workbook_id,
+                task_id=task_id,
             )
         except Exception as exc:
             LOG.error("Failed batch competitor summary: %s", exc)
@@ -523,7 +673,10 @@ class Pipeline:
 
         try:
             market = self.analyzer.generate_market_summary(
-                workbook_rows, workbook_points_map
+                workbook_rows,
+                workbook_points_map,
+                workbook_id=workbook_id,
+                task_id=task_id,
             )
         except Exception as exc:
             LOG.error("Failed market summary: %s", exc)
@@ -537,6 +690,8 @@ class Pipeline:
                 workbook_rows,
                 batch_competitor_summary_text=batch_summary_text,
                 market_summary_text=market_summary_text,
+                workbook_id=workbook_id,
+                task_id=task_id,
             )
         except Exception as exc:
             LOG.error("Failed final conclusion: %s", exc)
@@ -564,7 +719,7 @@ class Pipeline:
         if not final_conclusion_text:
             final_conclusion_text = (
                 "本次样本暂缺可用分析数据，无法生成稳定结论。"
-                "请重试任务并检查 Gemini 服务状态、网络稳定性与图文详情抓取结果。"
+                "请重试任务并检查 Gemini 服务状态、网络稳定性与详情抓取结果。"
             )
         if not market.get("summary_text"):
             market["summary_text"] = market_summary_text
@@ -836,21 +991,27 @@ class Pipeline:
             )
         self._reset_login_recovery_events()
 
-        workbook_name = (
-            workbook_name
-            or f"{keyword}-top{top_n}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        )
-        workbook = self.workbook_service.create(workbook_name)
-        workbook_id = workbook["workbook_id"]
-
         normalized_inputs: list[UrlRecord] = []
         seen_input_ids: set[str] = set()
         for raw_url in input_urls or []:
-            rec = normalize_url(raw_url)
+            rec = normalize_url(
+                raw_url,
+                default_platform=self.platform,
+                allowed_platforms={self.platform},
+            )
             if not rec or rec.item_id in seen_input_ids:
                 continue
             seen_input_ids.add(rec.item_id)
             normalized_inputs.append(rec)
+        source_mode = "input_urls" if normalized_inputs else "keyword_search"
+
+        workbook_name = workbook_name or self._next_default_workbook_name(
+            keyword=keyword,
+            top_n=top_n,
+            source_mode=source_mode,
+        )
+        workbook = self.workbook_service.create(workbook_name)
+        workbook_id = workbook["workbook_id"]
 
         search_started_at = time.perf_counter()
         if normalized_inputs:
@@ -869,7 +1030,7 @@ class Pipeline:
         search_elapsed_sec = self._elapsed_seconds(search_started_at)
         if not search_records:
             raise RuntimeError(
-                "no Taobao item URL found; provide --item-url/--item-urls-file or use a real signed-in browser session"
+                f"no {self.platform.upper()} item URL found; provide --item-url/--item-urls-file or use a real signed-in browser session"
             )
 
         self.url_service.add_records(
@@ -974,7 +1135,12 @@ class Pipeline:
 
                 crawl_success += 1
                 self._apply_crawl_detail(row, detail)
-                future = llm_extract_executor.submit(self._extract_points_for_detail, detail)
+                future = llm_extract_executor.submit(
+                    self._extract_points_for_detail,
+                    detail,
+                    workbook_id=workbook_id,
+                    task_id=task_id,
+                )
                 pending_llm_futures.append(((rec, row, detail), future))
 
             # Crawl stage ends when all crawl coroutines are done; LLM extraction futures
@@ -1033,6 +1199,7 @@ class Pipeline:
                         "points": points,
                         "detail_summary": row["detail_summary"],
                         "detail_blocks": detail.detail_blocks,
+                        "visit_chain": detail.visit_chain,
                         "updated_at": now_iso(),
                     }
                 else:
@@ -1069,6 +1236,9 @@ class Pipeline:
                     payload[1],
                     workbook_points_map,
                     item_title=payload[0].get("title", ""),
+                    item_platform=payload[0].get("platform", ""),
+                    workbook_id=workbook_id,
+                    task_id=task_id,
                 ),
                 max_workers=llm_workers,
                 min_workers=llm_workers_min,
@@ -1113,16 +1283,27 @@ class Pipeline:
                 workbook_name=workbook["workbook_name"],
                 workbook_rows=workbook_rows,
                 workbook_points_map=workbook_points_map,
+                task_id=task_id,
             )
 
             self.storage.save_products(products)
             self.storage.write_json(self.storage.selling_points_json, selling_points)
             self.storage.write_json(self.storage.market_report_json, market_payload)
 
+            resolved_output_path = output_path
+            resolved_html_output_path = html_output_path
+            if not resolved_output_path and not resolved_html_output_path:
+                default_export_stem = self._default_export_stem(
+                    workbook["workbook_name"],
+                    source_mode=source_mode,
+                )
+                resolved_output_path = str(default_export_stem.with_suffix(".md"))
+                resolved_html_output_path = str(default_export_stem.with_suffix(".html"))
+
             export_md_path, export_html_path = self.export_html_and_md(
                 workbook_id=workbook_id,
-                output_path=output_path,
-                html_output_path=html_output_path,
+                output_path=resolved_output_path,
+                html_output_path=resolved_html_output_path,
                 allow_incomplete=False,
                 ignore_running_task_ids={task_id},
             )
@@ -1130,6 +1311,7 @@ class Pipeline:
             total_elapsed_sec = self._elapsed_seconds(run_started_at)
 
             result = {
+                "platform": self.platform,
                 "workbook_id": workbook_id,
                 "workbook_name": workbook["workbook_name"],
                 "task_id": task_id,
@@ -1141,7 +1323,13 @@ class Pipeline:
                 "batch_competitor_summary": batch_summary_text,
                 "market_summary": market_summary_text,
                 "final_conclusion": final_conclusion_text,
-                "source_mode": "input_urls" if normalized_inputs else "keyword_search",
+                "source_mode": source_mode,
+                "input_urls_used": [rec.normalized_url for rec in normalized_inputs],
+                "search_target_url": (
+                    search_url or _default_search_url(self.platform, keyword)
+                    if source_mode == "keyword_search"
+                    else ""
+                ),
                 "login_recovery_events": self._collect_login_recovery_events(),
                 "workers": {
                     "crawl_workers": effective_crawl_workers,
@@ -1164,6 +1352,7 @@ class Pipeline:
                 keyword=keyword,
                 status="completed",
                 result_payload=result,
+                source_mode=source_mode,
                 run_log_path=run_log_path,
             )
             result["run_summary"] = summary_payload
@@ -1203,6 +1392,7 @@ class Pipeline:
                 keyword=keyword,
                 status="failed",
                 result_payload=fail_result,
+                source_mode=source_mode,
                 error_text=error_text,
                 run_log_path=run_log_path,
             )
@@ -1251,21 +1441,27 @@ class Pipeline:
             )
         self._reset_login_recovery_events()
 
-        workbook_name = (
-            workbook_name
-            or f"{keyword}-top{top_n}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        )
-        workbook = self.workbook_service.create(workbook_name)
-        workbook_id = workbook["workbook_id"]
-
         normalized_inputs: list[UrlRecord] = []
         seen_input_ids: set[str] = set()
         for raw_url in input_urls or []:
-            rec = normalize_url(raw_url)
+            rec = normalize_url(
+                raw_url,
+                default_platform=self.platform,
+                allowed_platforms={self.platform},
+            )
             if not rec or rec.item_id in seen_input_ids:
                 continue
             seen_input_ids.add(rec.item_id)
             normalized_inputs.append(rec)
+        source_mode = "input_urls" if normalized_inputs else "keyword_search"
+
+        workbook_name = workbook_name or self._next_default_workbook_name(
+            keyword=keyword,
+            top_n=top_n,
+            source_mode=source_mode,
+        )
+        workbook = self.workbook_service.create(workbook_name)
+        workbook_id = workbook["workbook_id"]
 
         search_started_at = time.perf_counter()
         if normalized_inputs:
@@ -1284,7 +1480,7 @@ class Pipeline:
         search_elapsed_sec = self._elapsed_seconds(search_started_at)
         if not search_records:
             raise RuntimeError(
-                "no Taobao item URL found; provide --item-url/--item-urls-file or use a real signed-in browser session"
+                f"no {self.platform.upper()} item URL found; provide --item-url/--item-urls-file or use a real signed-in browser session"
             )
 
         self.url_service.add_records(
@@ -1352,6 +1548,7 @@ class Pipeline:
                                 detail_blocks=[],
                                 citations=[],
                                 crawl_time=now_iso(),
+                                platform=rec.platform,
                                 error=f"{type(exc).__name__}: {exc}",
                             )
 
@@ -1366,7 +1563,10 @@ class Pipeline:
 
                         # Immediately submit to LLM Extract (pipeline parallel)
                         llm_future = llm_extract_executor.submit(
-                            self._extract_points_for_detail, detail
+                            self._extract_points_for_detail,
+                            detail,
+                            workbook_id=workbook_id,
+                            task_id=task_id,
                         )
                         pending_llm_futures.append(((rec, row, detail), llm_future))
 
@@ -1416,6 +1616,7 @@ class Pipeline:
                         "points": points,
                         "detail_summary": row["detail_summary"],
                         "detail_blocks": detail.detail_blocks,
+                        "visit_chain": detail.visit_chain,
                         "updated_at": now_iso(),
                     }
                 else:
@@ -1444,6 +1645,9 @@ class Pipeline:
                     payload[1],
                     workbook_points_map,
                     item_title=payload[0].get("title", ""),
+                    item_platform=payload[0].get("platform", ""),
+                    workbook_id=workbook_id,
+                    task_id=task_id,
                 ),
                 max_workers=llm_workers,
                 min_workers=llm_workers_min,
@@ -1478,22 +1682,34 @@ class Pipeline:
                 workbook_name=workbook["workbook_name"],
                 workbook_rows=workbook_rows,
                 workbook_points_map=workbook_points_map,
+                task_id=task_id,
             )
 
             self.storage.save_products(products)
             self.storage.write_json(self.storage.selling_points_json, selling_points)
             self.storage.write_json(self.storage.market_report_json, market_payload)
 
+            resolved_output_path = output_path
+            resolved_html_output_path = html_output_path
+            if not resolved_output_path and not resolved_html_output_path:
+                default_export_stem = self._default_export_stem(
+                    workbook["workbook_name"],
+                    source_mode=source_mode,
+                )
+                resolved_output_path = str(default_export_stem.with_suffix(".md"))
+                resolved_html_output_path = str(default_export_stem.with_suffix(".html"))
+
             export_md_path, export_html_path = self.export_html_and_md(
                 workbook_id=workbook_id,
-                output_path=output_path,
-                html_output_path=html_output_path,
+                output_path=resolved_output_path,
+                html_output_path=resolved_html_output_path,
                 allow_incomplete=False,
                 ignore_running_task_ids={task_id},
             )
             export_elapsed_sec = self._elapsed_seconds(export_started_at)
             total_elapsed_sec = self._elapsed_seconds(run_started_at)
             result = {
+                "platform": self.platform,
                 "workbook_id": workbook_id,
                 "workbook_name": workbook["workbook_name"],
                 "task_id": task_id,
@@ -1505,7 +1721,13 @@ class Pipeline:
                 "batch_competitor_summary": batch_summary_text,
                 "market_summary": market_summary_text,
                 "final_conclusion": final_conclusion_text,
-                "source_mode": "input_urls" if normalized_inputs else "keyword_search",
+                "source_mode": source_mode,
+                "input_urls_used": [rec.normalized_url for rec in normalized_inputs],
+                "search_target_url": (
+                    search_url or _default_search_url(self.platform, keyword)
+                    if source_mode == "keyword_search"
+                    else ""
+                ),
                 "login_recovery_events": self._collect_login_recovery_events(),
                 "workers": {
                     "crawl_workers": effective_crawl_workers,
@@ -1607,6 +1829,8 @@ class Pipeline:
                         detail_blocks=[],
                         citations=[],
                         crawl_time=now_iso(),
+                        platform=clean_text(str(row.get("platform", "")), max_len=20).lower()
+                        or "taobao",
                         error=f"{type(exc).__name__}: {exc}",
                     )
 
@@ -1621,7 +1845,10 @@ class Pipeline:
 
                 # Immediately submit to LLM Extract (pipeline parallel)
                 llm_future = llm_extract_executor.submit(
-                    self._extract_points_for_detail, detail
+                    self._extract_points_for_detail,
+                    detail,
+                    workbook_id=workbook_id,
+                    task_id=task_id,
                 )
                 pending_llm_futures.append(((row, detail), llm_future))
 
@@ -1670,6 +1897,7 @@ class Pipeline:
                     "points": points,
                     "detail_summary": row["detail_summary"],
                     "detail_blocks": detail.detail_blocks,
+                    "visit_chain": detail.visit_chain,
                     "updated_at": now_iso(),
                 }
             row["updated_at"] = now_iso()
@@ -1695,12 +1923,15 @@ class Pipeline:
         llm_analyze_started_at = time.perf_counter()
         analyze_results = self._run_adaptive_stage(
             items=analyze_inputs,
-            worker_fn=lambda payload: self.analyzer.analyze_item(
-                payload[0]["item_id"],
-                payload[1],
-                workbook_points_map,
-                item_title=payload[0].get("title", ""),
-            ),
+                worker_fn=lambda payload: self.analyzer.analyze_item(
+                    payload[0]["item_id"],
+                    payload[1],
+                    workbook_points_map,
+                    item_title=payload[0].get("title", ""),
+                    item_platform=payload[0].get("platform", ""),
+                    workbook_id=workbook_id,
+                    task_id=task_id,
+                ),
             max_workers=llm_workers,
             min_workers=llm_workers_min,
             stage_name="llm-analyze",
@@ -1734,6 +1965,7 @@ class Pipeline:
             workbook_name=workbook["workbook_name"],
             workbook_rows=workbook_rows,
             workbook_points_map=workbook_points_map,
+            task_id=task_id,
         )
 
         self.storage.save_products(products)
@@ -1784,13 +2016,15 @@ def print_json(payload: Any) -> None:
         sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
 
 
-def _default_storage_state_file() -> str:
-    env_value = (os.getenv("TAOBAO_STORAGE_STATE_FILE", "") or "").strip()
+def _default_storage_state_file(platform: str = "taobao") -> str:
+    env_key = "JD_STORAGE_STATE_FILE" if platform == "jd" else "TAOBAO_STORAGE_STATE_FILE"
+    default_name = "jd_storage_state.json" if platform == "jd" else "taobao_storage_state.json"
+    env_value = (os.getenv(env_key, "") or "").strip()
     if env_value:
         return env_value
     candidates = [
-        Path("backend/data/taobao_storage_state.json"),
-        Path("data/taobao_storage_state.json"),
+        Path(f"backend/data/{default_name}"),
+        Path(f"data/{default_name}"),
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -1801,6 +2035,7 @@ def _default_storage_state_file() -> str:
 def build_parser() -> argparse.ArgumentParser:
     manual_wait_default = 0
     manual_login_timeout_default = 300
+    jd_manual_login_timeout_default = 300
     gemini_timeout_default = 45
     gemini_pro_retries_default = 2
     shop_filter_default = (os.getenv("SHOP_FILTER", "on") or "on").strip().lower()
@@ -1817,6 +2052,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
     except ValueError:
         manual_login_timeout_default = 300
+    try:
+        jd_manual_login_timeout_default = max(
+            30, int(os.getenv("JD_MANUAL_LOGIN_TIMEOUT_SEC", "300"))
+        )
+    except ValueError:
+        jd_manual_login_timeout_default = 300
     try:
         gemini_timeout_default = max(5, int(os.getenv("GEMINI_TIMEOUT_SEC", "45")))
     except ValueError:
@@ -1845,7 +2086,7 @@ def build_parser() -> argparse.ArgumentParser:
         llm_workers_min_default = llm_workers_default
 
     parser = argparse.ArgumentParser(
-        description="Taobao market-research pipeline: keyword/search-url -> top-n items -> CSV/HTML outputs."
+        description="Marketplace research pipeline for Taobao/Tmall/JD: keyword/search-url -> top-n items -> CSV/HTML outputs."
     )
     parser.add_argument(
         "--data-dir", default=os.getenv("DATA_DIR", "data"), help="Data directory"
@@ -1869,6 +2110,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--taobao-manual-login-timeout-sec",
         type=int,
         default=manual_login_timeout_default,
+    )
+    parser.add_argument(
+        "--jd-browser-mode",
+        default=os.getenv("JD_BROWSER_MODE", "cdp"),
+        choices=["cdp", "persistent"],
+    )
+    parser.add_argument(
+        "--jd-storage-state-file",
+        default=_default_storage_state_file("jd"),
+        help="JD Playwright storage_state JSON path",
+    )
+    parser.add_argument(
+        "--jd-user-data-dir",
+        default=_default_user_data_dir("jd"),
+        help="JD persistent browser profile directory",
+    )
+    parser.add_argument(
+        "--jd-manual-login-timeout-sec",
+        type=int,
+        default=jd_manual_login_timeout_default,
     )
     parser.add_argument(
         "--playwright-headless",
@@ -1913,7 +2174,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--shop-filter",
         choices=["on", "off"],
         default=shop_filter_default,
-        help="Filter search results by preferred shop names: official/flagship/Tmall+self-operated",
+        help="Filter search results by preferred shop names: official/flagship/self-operated",
     )
     parser.add_argument(
         "--crawl-workers",
@@ -1975,6 +2236,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional HTML output path; default follows Markdown path",
     )
+    _add_debug_args(analyze)
 
     final_csv = sub.add_parser(
         "final-csv", help="Alias of analyze-keyword for direct final HTML+Markdown output."
@@ -2013,6 +2275,77 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional HTML output path; default follows Markdown path",
     )
+    _add_debug_args(final_csv)
+
+    jd_analyze = sub.add_parser(
+        "jd-analyze-keyword",
+        help="Create workbook and run full JD flow from one keyword.",
+    )
+    jd_analyze.add_argument("keyword")
+    jd_analyze.add_argument("--top-n", type=int, default=5)
+    jd_analyze.add_argument(
+        "--search-url", default="", help="Optional JD search URL to open directly"
+    )
+    jd_analyze.add_argument(
+        "--item-url",
+        action="append",
+        default=[],
+        help="Direct JD item URL; repeat for multiple",
+    )
+    jd_analyze.add_argument(
+        "--item-urls-file",
+        default="",
+        help="Text file containing one JD item URL per line",
+    )
+    jd_analyze.add_argument(
+        "--search-sort",
+        choices=["page", "sales"],
+        default="page",
+        help="Search result selection order",
+    )
+    jd_analyze.add_argument("--workbook-name", default="")
+    jd_analyze.add_argument("--output", default="")
+    jd_analyze.add_argument(
+        "--html-output",
+        default="",
+        help="Optional HTML output path; default follows Markdown path",
+    )
+    _add_debug_args(jd_analyze)
+
+    jd_final_csv = sub.add_parser(
+        "jd-final-csv",
+        help="Alias of jd-analyze-keyword for direct final HTML+Markdown output.",
+    )
+    jd_final_csv.add_argument("keyword")
+    jd_final_csv.add_argument("--top-n", type=int, default=5)
+    jd_final_csv.add_argument(
+        "--search-url", default="", help="Optional JD search URL to open directly"
+    )
+    jd_final_csv.add_argument(
+        "--item-url",
+        action="append",
+        default=[],
+        help="Direct JD item URL; repeat for multiple",
+    )
+    jd_final_csv.add_argument(
+        "--item-urls-file",
+        default="",
+        help="Text file containing one JD item URL per line",
+    )
+    jd_final_csv.add_argument(
+        "--search-sort",
+        choices=["page", "sales"],
+        default="page",
+        help="Search result selection order",
+    )
+    jd_final_csv.add_argument("--workbook-name", default="")
+    jd_final_csv.add_argument("--output", default="")
+    jd_final_csv.add_argument(
+        "--html-output",
+        default="",
+        help="Optional HTML output path; default follows Markdown path",
+    )
+    _add_debug_args(jd_final_csv)
 
     create_wb = sub.add_parser("create-workbook")
     create_wb.add_argument("workbook_name")
@@ -2095,6 +2428,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def setup_services(
     args: argparse.Namespace,
+    *,
+    platform: str = "taobao",
 ) -> tuple[Pipeline, WorkbookService, GroupService, URLService, TaskTracker, Storage]:
     storage = Storage(data_dir=args.data_dir)
     workbook_service = WorkbookService(storage)
@@ -2103,26 +2438,42 @@ def setup_services(
     requested_headless = args.playwright_headless == "1"
     if requested_headless:
         LOG.warning(
-            "Headless mode was requested but is forced off for Taobao to reduce anti-bot risk."
+            "Headless mode was requested but is forced off to reduce anti-bot risk."
         )
     effective_headless = False
-    browser_mode = str(args.taobao_browser_mode or "cdp").strip().lower()
+    platform = str(platform or "taobao").strip().lower()
+    if platform == "jd":
+        browser_mode = str(args.jd_browser_mode or "cdp").strip().lower()
+        storage_state_file = Path(
+            args.jd_storage_state_file or _default_storage_state_file("jd")
+        )
+        user_data_dir = Path(args.jd_user_data_dir or _default_user_data_dir("jd"))
+        manual_login_timeout_sec = max(30, int(args.jd_manual_login_timeout_sec))
+        search_client_cls = JDSearchClient
+        crawler_cls = JDCrawler
+    else:
+        browser_mode = str(args.taobao_browser_mode or "cdp").strip().lower()
+        storage_state_file = Path(
+            args.taobao_storage_state_file or _default_storage_state_file("taobao")
+        )
+        user_data_dir = Path(
+            args.taobao_user_data_dir or _default_user_data_dir("taobao")
+        )
+        manual_login_timeout_sec = max(30, int(args.taobao_manual_login_timeout_sec))
+        search_client_cls = SearchClient
+        crawler_cls = Crawler
     if browser_mode not in {"cdp", "persistent"}:
         browser_mode = "cdp"
-    storage_state_file = Path(
-        args.taobao_storage_state_file or _default_storage_state_file()
-    )
-    user_data_dir = Path(args.taobao_user_data_dir or _default_user_data_dir())
-    search_client = SearchClient(
+    search_client = search_client_cls(
         headless=effective_headless,
         browser_mode=browser_mode,
         cdp_url=args.playwright_cdp_url or "",
         manual_wait_seconds=max(0, int(args.manual_wait_seconds)),
         storage_state_file=storage_state_file,
         user_data_dir=user_data_dir,
-        manual_login_timeout_sec=max(30, int(args.taobao_manual_login_timeout_sec)),
+        manual_login_timeout_sec=manual_login_timeout_sec,
     )
-    crawler = Crawler(
+    crawler = crawler_cls(
         storage=storage,
         headless=effective_headless,
         browser_mode=browser_mode,
@@ -2130,7 +2481,7 @@ def setup_services(
         manual_wait_seconds=max(0, int(args.manual_wait_seconds)),
         storage_state_file=storage_state_file,
         user_data_dir=user_data_dir,
-        manual_login_timeout_sec=max(30, int(args.taobao_manual_login_timeout_sec)),
+        manual_login_timeout_sec=manual_login_timeout_sec,
     )
     extractor = SellingPointExtractor(
         gemini_api_key=os.getenv("GEMINI_API_KEY"),
@@ -2159,6 +2510,7 @@ def setup_services(
         extractor=extractor,
         analyzer=analyzer,
         task_tracker=task_tracker,
+        platform=platform,
     )
     return pipeline, workbook_service, group_service, url_service, task_tracker, storage
 
@@ -2171,35 +2523,69 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    platform = (
+        "jd" if args.command in {"jd-analyze-keyword", "jd-final-csv"} else "taobao"
+    )
     pipeline, workbook_service, group_service, url_service, task_tracker, storage = (
-        setup_services(args)
+        setup_services(args, platform=platform)
     )
     try:
-        if args.command in {"analyze-keyword", "final-csv"}:
+        if args.command in {
+            "analyze-keyword",
+            "final-csv",
+            "jd-analyze-keyword",
+            "jd-final-csv",
+        }:
             import asyncio
             from tools import cleanup_global_browser
+            from generate_gemini_debug_html import build_debug_bundle
 
             input_urls = list(args.item_url or [])
             input_urls.extend(load_url_lines(args.item_urls_file or None))
             shop_filter_enabled = str(args.shop_filter or "on").strip().lower() == "on"
             if bool(getattr(args, "official_only", False)):
                 shop_filter_enabled = True
+            debug_enabled = bool(getattr(args, "debug_mode", False))
+            debug_source_mode = "input_urls" if input_urls else "keyword_search"
+            previous_debug_env = os.environ.get("TAOBAO_INSIGHT_GEMINI_DEBUG_DIR")
+            debug_bundle_dir: Path | None = None
+            debug_raw_dir: Path | None = None
+            if debug_enabled:
+                debug_bundle_dir = (
+                    Path(args.debug_bundle_dir).resolve()
+                    if str(getattr(args, "debug_bundle_dir", "") or "").strip()
+                    else _default_debug_bundle_dir(
+                        storage.data_dir,
+                        platform,
+                        args.keyword,
+                        max(1, min(args.top_n, MAX_TOP_N)),
+                        source_mode=debug_source_mode,
+                    ).resolve()
+                )
+                debug_raw_dir = debug_bundle_dir / "_raw_gemini"
+                os.environ["TAOBAO_INSIGHT_GEMINI_DEBUG_DIR"] = str(debug_raw_dir)
 
             # Use async version to maintain single event loop
-            payload = asyncio.run(pipeline.run_keyword_async(
-                keyword=args.keyword,
-                top_n=max(1, min(args.top_n, MAX_TOP_N)),
-                workbook_name=args.workbook_name or None,
-                search_url=args.search_url or None,
-                search_sort=args.search_sort,
-                shop_filter_enabled=shop_filter_enabled,
-                output_path=args.output or None,
-                html_output_path=args.html_output or None,
-                input_urls=input_urls,
-                crawl_workers=max(1, int(args.crawl_workers)),
-                llm_workers=max(1, int(args.llm_workers)),
-                llm_workers_min=max(1, int(args.llm_workers_min)),
-            ))
+            try:
+                payload = asyncio.run(pipeline.run_keyword_async(
+                    keyword=args.keyword,
+                    top_n=max(1, min(args.top_n, MAX_TOP_N)),
+                    workbook_name=args.workbook_name or None,
+                    search_url=args.search_url or None,
+                    search_sort=args.search_sort,
+                    shop_filter_enabled=shop_filter_enabled,
+                    output_path=args.output or None,
+                    html_output_path=args.html_output or None,
+                    input_urls=input_urls,
+                    crawl_workers=max(1, int(args.crawl_workers)),
+                    llm_workers=max(1, int(args.llm_workers)),
+                    llm_workers_min=max(1, int(args.llm_workers_min)),
+                ))
+            finally:
+                if previous_debug_env is None:
+                    os.environ.pop("TAOBAO_INSIGHT_GEMINI_DEBUG_DIR", None)
+                else:
+                    os.environ["TAOBAO_INSIGHT_GEMINI_DEBUG_DIR"] = previous_debug_env
 
             # Cleanup browser to save cookies and session
             # This is important for persistent mode to save login state
@@ -2208,6 +2594,23 @@ def main(argv: list[str] | None = None) -> int:
                 LOG.info("Browser cleaned up, cookies saved")
             except Exception as cleanup_exc:
                 LOG.warning(f"Browser cleanup failed (non-critical): {cleanup_exc}")
+
+            if debug_enabled and debug_bundle_dir is not None and debug_raw_dir is not None:
+                try:
+                    bundle = build_debug_bundle(
+                        data_dir=storage.data_dir,
+                        debug_dir=debug_raw_dir,
+                        workbook_id=str(payload.get("workbook_id", "")),
+                        task_id=str(payload.get("task_id", "")),
+                        bundle_dir=debug_bundle_dir,
+                    )
+                    payload["debug_bundle_dir"] = str(bundle["bundle_dir"])
+                    payload["debug_bundle_html"] = str(bundle["html"])
+                    payload["debug_analysis_json"] = str(bundle["analysis_json"])
+                    if debug_raw_dir.exists():
+                        shutil.rmtree(debug_raw_dir, ignore_errors=True)
+                except Exception as debug_exc:
+                    LOG.warning("Failed to build debug bundle: %s", debug_exc, exc_info=True)
 
             print_json(payload)
 

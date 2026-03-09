@@ -5,6 +5,9 @@
 # Browser data and profiles
 data/taobao_*.json
 data/*_profile/
+data/tmp_profile_test/
+data/tmp_*/
+browser_data/
 scripts/data/
 
 # Scraped data exports

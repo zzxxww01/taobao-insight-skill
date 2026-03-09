@@ -79,6 +79,133 @@ def detect_antibot_signal(*texts: str) -> str:
     return ""
 
 
+def _build_login_recovery_event(
+    *,
+    source: str,
+    stage: str,
+    blocked_reason: str,
+    current_url: str,
+    login_result: LoginHandleResult,
+    browser_mode: str,
+    storage_state_file: Path,
+    user_data_dir: Path,
+    item_id: str = "",
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "source": str(source or ""),
+        "stage": str(stage or ""),
+        "ok": bool(login_result.ok),
+        "blocked_reason": str(blocked_reason or ""),
+        "final_state": str(login_result.final_state or ""),
+        "reason": str(login_result.reason or ""),
+        "elapsed_sec": round(float(login_result.elapsed_sec), 3),
+        "url": str(current_url or ""),
+        "browser_mode": str(browser_mode or ""),
+        "storage_state_file": str(storage_state_file),
+        "user_data_dir": str(user_data_dir),
+        "cookie_fingerprint_before": str(login_result.cookie_fingerprint_before or ""),
+        "cookie_fingerprint_after": str(login_result.cookie_fingerprint_after or ""),
+        "cookie_changed": bool(login_result.cookie_changed),
+        "decision_trace": list(login_result.decision_trace),
+        "updated_at": now_iso(),
+    }
+    if item_id:
+        event["item_id"] = str(item_id)
+    return event
+
+
+def _read_storage_state_cookies(storage_state_file: Path) -> list[dict[str, Any]]:
+    if not storage_state_file.exists():
+        return []
+    try:
+        payload = json.loads(storage_state_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOG.warning("Failed to read storage state %s: %s", storage_state_file, exc)
+        return []
+    cookies = payload.get("cookies", []) if isinstance(payload, dict) else []
+    return [row for row in cookies if isinstance(row, dict)]
+
+
+def _cookie_header_for_domains(
+    storage_state_file: Path,
+    *,
+    allowed_domain_tokens: tuple[str, ...],
+) -> str:
+    cookie_pairs: list[str] = []
+    for cookie in _read_storage_state_cookies(storage_state_file):
+        domain = str(cookie.get("domain", "")).lower()
+        if not any(token in domain for token in allowed_domain_tokens):
+            continue
+        name = str(cookie.get("name", "")).strip()
+        value = str(cookie.get("value", "")).strip()
+        if not name:
+            continue
+        cookie_pairs.append(f"{name}={value}")
+    return "; ".join(cookie_pairs)
+
+
+async def _browser_fetch_text_via_page(
+    page: Any,
+    target_url: str,
+    *,
+    accept: str,
+    max_len: int = 1_200_000,
+) -> str:
+    script = f"""
+(async () => {{
+  try {{
+    const response = await fetch({json.dumps(str(target_url or ""), ensure_ascii=False)}, {{
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      headers: {{
+        "Accept": {json.dumps(str(accept or "*/*"), ensure_ascii=False)}
+      }}
+    }});
+    const text = await response.text();
+    return String(text || "").slice(0, {int(max_len)});
+  }} catch (error) {{
+    return "";
+  }}
+}})()
+"""
+    try:
+        value = await page.evaluate(script)
+    except Exception:
+        return ""
+    return str(value or "")
+
+
+async def _browser_user_agent(page: Any) -> str:
+    try:
+        value = await page.evaluate("navigator.userAgent || ''")
+    except Exception:
+        return ""
+    return str(value or "").strip()
+
+
+def _http_fetch_text_with_cookie_header(
+    target_url: str,
+    *,
+    user_agent: str,
+    referer: str,
+    accept: str,
+    cookie_header: str,
+    timeout_sec: int = 20,
+    max_len: int = 1_200_000,
+) -> str:
+    headers = {
+        "User-Agent": user_agent or "Mozilla/5.0",
+        "Referer": referer,
+        "Accept": accept,
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    request = urllib.request.Request(target_url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        return str(response.read().decode("utf-8", errors="replace"))[:max_len]
+
+
 def is_item_detail_url(url: str) -> bool:
     lower = (url or "").lower()
     return "detail.tmall.com/item.htm" in lower or "item.taobao.com/item.htm" in lower
@@ -98,13 +225,13 @@ def load_url_lines(path: str | None) -> list[str]:
     return lines
 
 
-def _default_user_data_dir() -> Path:
+def _default_user_data_dir(profile_name: str = "taobao_insight_profile") -> Path:
     appdata = os.getenv("APPDATA", "")
     if appdata:
-        return Path(appdata) / "taobao_insight_profile"
+        return Path(appdata) / profile_name
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "taobao_insight_profile"
-    return Path.home() / ".config" / "taobao_insight_profile"
+        return Path.home() / "Library" / "Application Support" / profile_name
+    return Path.home() / ".config" / profile_name
 
 
 def _cdp_http_base(cdp_url: str) -> str:
@@ -153,6 +280,12 @@ def list_cdp_pages(cdp_url: str) -> list[dict[str, str]]:
 
 
 class SearchClient:
+    DEFAULT_STORAGE_STATE_FILE = "taobao_storage_state.json"
+    DEFAULT_USER_DATA_DIR_NAME = "taobao_insight_profile"
+    PLATFORM_LABEL = "Taobao"
+    LOGIN_HANDLER_CLS = TaobaoLogin
+    DETECT_NON_PRODUCT_PAGE_FN = staticmethod(detect_non_product_page)
+
     def __init__(
         self,
         headless: bool = False,
@@ -172,12 +305,13 @@ class SearchClient:
         self.storage_state_file = (
             Path(storage_state_file).resolve()
             if storage_state_file
-            else Path("data/taobao_storage_state.json").resolve()
+            else Path("data") / self.DEFAULT_STORAGE_STATE_FILE
         )
+        self.storage_state_file = self.storage_state_file.resolve()
         self.user_data_dir = (
             Path(user_data_dir).resolve()
             if user_data_dir
-            else _default_user_data_dir().resolve()
+            else _default_user_data_dir(self.DEFAULT_USER_DATA_DIR_NAME).resolve()
         )
         self.manual_login_timeout_sec = max(30, int(manual_login_timeout_sec))
 
@@ -185,6 +319,18 @@ class SearchClient:
         self._global_browser_manager: Any = None
         # Structured login recovery events for diagnostics/output.
         self.login_recovery_events: list[dict[str, Any]] = []
+        self._restored_storage_state_context_ids: set[int] = set()
+
+    def _effective_browser_mode(self) -> str:
+        if self._global_browser_manager is not None:
+            mode = getattr(self._global_browser_manager, "current_mode", "")
+            if mode:
+                return str(mode)
+        return self.browser_mode
+
+    def _detect_non_product_page(self, current_url: str, title: str, body_text: str) -> str:
+        detector = getattr(self, "DETECT_NON_PRODUCT_PAGE_FN", detect_non_product_page)
+        return str(detector(current_url, title, body_text) or "")
 
     @staticmethod
     def _records_from_candidate_urls(urls: list[str], top_n: int) -> list[UrlRecord]:
@@ -253,6 +399,24 @@ class SearchClient:
         except Exception:
             return
 
+    async def _restore_storage_state_async(self, context: Any) -> None:
+        context_key = id(context)
+        if context_key in self._restored_storage_state_context_ids:
+            return
+        normalized = _read_storage_state_cookies(self.storage_state_file)
+        if not normalized:
+            return
+        try:
+            await context.add_cookies(normalized)
+            self._restored_storage_state_context_ids.add(context_key)
+            LOG.info(
+                "Restored %s cookies from storage state %s",
+                len(normalized),
+                self.storage_state_file,
+            )
+        except Exception as exc:
+            LOG.warning("Failed to restore cookies from %s: %s", self.storage_state_file, exc)
+
     async def _read_page_snapshot_async(self, page: Any) -> tuple[str, str, str]:
         current_url = page.url or ""
         try:
@@ -269,34 +433,33 @@ class SearchClient:
         self, page: Any, context: Any, stage: str
     ) -> bool:
         current_url, title, body_text = await self._read_page_snapshot_async(page)
-        reason = detect_non_product_page(current_url, title, body_text)
+        reason = self._detect_non_product_page(current_url, title, body_text)
         if not reason:
             return False
 
-        LOG.warning("Detected blocked page during %s: %s", stage, reason)
-        login_handler = TaobaoLogin(
+        LOG.warning("[%s] Detected blocked page during %s: %s", self.PLATFORM_LABEL, stage, reason)
+        login_handler = self.LOGIN_HANDLER_CLS(
             browser_context=context,
             context_page=page,
             login_timeout_sec=self.manual_login_timeout_sec,
         )
         login_result: LoginHandleResult = await login_handler.check_and_handle_login()
         self.login_recovery_events.append(
-            {
-                "source": "search",
-                "stage": stage,
-                "ok": bool(login_result.ok),
-                "blocked_reason": reason,
-                "final_state": login_result.final_state,
-                "reason": login_result.reason,
-                "elapsed_sec": round(float(login_result.elapsed_sec), 3),
-                "url": current_url,
-                "decision_trace": login_result.decision_trace,
-                "updated_at": now_iso(),
-            }
+            _build_login_recovery_event(
+                source="search",
+                stage=stage,
+                blocked_reason=reason,
+                current_url=current_url,
+                login_result=login_result,
+                browser_mode=self._effective_browser_mode(),
+                storage_state_file=self.storage_state_file,
+                user_data_dir=self.user_data_dir,
+            )
         )
         if not login_result.ok:
             raise RuntimeError(
-                f"Login timeout in {stage}, still blocked: {reason} ({login_result.reason})"
+                f"{self.PLATFORM_LABEL} login timeout in {stage}, still blocked: "
+                f"{reason} ({login_result.reason})"
             )
 
         # Persist cookies/state immediately after successful login recovery.
@@ -313,8 +476,15 @@ class SearchClient:
         # First pass: handle login/captcha interception.
         login_handled = await self._handle_login_if_needed_async(page, context, stage)
         if login_handled:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=120_000)
-            await page.wait_for_timeout(max(3000, self.manual_wait_seconds * 1000))
+            recovered_url, recovered_title, recovered_body = await self._read_page_snapshot_async(page)
+            recovered_reason = self._detect_non_product_page(
+                recovered_url,
+                recovered_title,
+                recovered_body,
+            )
+            if recovered_reason or not is_search_result_url(recovered_url):
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=120_000)
+                await page.wait_for_timeout(max(3000, self.manual_wait_seconds * 1000))
 
         current_url, _, _ = await self._read_page_snapshot_async(page)
         if is_item_detail_url(current_url):
@@ -363,6 +533,11 @@ class SearchClient:
         target_url = (
             search_url or f"https://s.taobao.com/search?q={quote_plus(keyword)}"
         )
+        fallback_target_url = ""
+        if not search_url and "s.taobao.com/search" in target_url:
+            fallback_target_url = (
+                f"https://list.tmall.com/search_product.htm?q={quote_plus(keyword)}"
+            )
         candidate_urls: list[str] = []
         card_records: list[dict[str, Any]] = []
         resource_urls: list[str] = []
@@ -381,11 +556,17 @@ class SearchClient:
                 cdp_url=self.cdp_url,
                 user_data_dir=str(self.user_data_dir),
             )
+        await self._restore_storage_state_async(context)
 
         page = None
+        owns_page = False
         try:
-            # Get a page using the global manager (has lock protection)
-            page = await self._global_browser_manager.get_page()
+            # Under raw CDP, prefer an isolated tab per search run to avoid cross-task interference.
+            if getattr(self._global_browser_manager, "current_mode", "") == "cdp":
+                page = await self._global_browser_manager.new_page()
+                owns_page = True
+            else:
+                page = await self._global_browser_manager.get_page()
 
             # Setup response capture
             async def _capture_response(resp: Any) -> None:
@@ -410,8 +591,34 @@ class SearchClient:
 
             page.on("response", _on_response)
 
-            # Navigate to search page
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=120_000)
+            # Navigate to search page. In some environments s.taobao.com can time out
+            # while Tmall search is still reachable, so keep a single fallback.
+            navigation_errors: list[str] = []
+            for candidate_target_url in [target_url, fallback_target_url]:
+                if not candidate_target_url:
+                    continue
+                try:
+                    await page.goto(
+                        candidate_target_url,
+                        wait_until="domcontentloaded",
+                        timeout=120_000,
+                    )
+                    if candidate_target_url != target_url:
+                        LOG.warning(
+                            "Primary Taobao search URL timed out or failed; fallback to %s",
+                            candidate_target_url,
+                        )
+                        target_url = candidate_target_url
+                    break
+                except Exception as exc:
+                    navigation_errors.append(
+                        f"{candidate_target_url} -> {type(exc).__name__}: {exc}"
+                    )
+            else:
+                raise RuntimeError(
+                    "failed to open any Taobao search surface: "
+                    + " | ".join(navigation_errors)
+                )
             await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
 
             await self._ensure_search_surface_async(
@@ -436,7 +643,7 @@ class SearchClient:
 
             # Extract card data
             try:
-                card_records = await page.evaluate("""
+                card_records = await page.evaluate(r"""
                     () => {
                       const nodes = Array.from(document.querySelectorAll('a[id^="item_id_"], a[href*="item.htm?id="]'));
                       const results = [];
@@ -509,8 +716,11 @@ class SearchClient:
             await self._persist_storage_state_async(context)
 
         finally:
-            # Don't close page or context - let GlobalBrowserManager manage lifecycle
-            pass
+            if owns_page and page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
         # Process records
         records = SearchClient._records_from_cards(
@@ -561,6 +771,12 @@ class SearchClient:
 
 
 class Crawler:
+    DEFAULT_STORAGE_STATE_FILE = "taobao_storage_state.json"
+    DEFAULT_USER_DATA_DIR_NAME = "taobao_insight_profile"
+    PLATFORM_LABEL = "Taobao"
+    LOGIN_HANDLER_CLS = TaobaoLogin
+    DETECT_NON_PRODUCT_PAGE_FN = staticmethod(detect_non_product_page)
+
     def __init__(
         self,
         storage: Storage,
@@ -582,17 +798,30 @@ class Crawler:
         self.storage_state_file = (
             Path(storage_state_file).resolve()
             if storage_state_file
-            else Path("data/taobao_storage_state.json").resolve()
+            else Path("data") / self.DEFAULT_STORAGE_STATE_FILE
         )
+        self.storage_state_file = self.storage_state_file.resolve()
         self.user_data_dir = (
             Path(user_data_dir).resolve()
             if user_data_dir
-            else _default_user_data_dir().resolve()
+            else _default_user_data_dir(self.DEFAULT_USER_DATA_DIR_NAME).resolve()
         )
         self.manual_login_timeout_sec = max(30, int(manual_login_timeout_sec))
         self._global_browser_manager: Any = None
         # Structured login recovery events for diagnostics/output.
         self.login_recovery_events: list[dict[str, Any]] = []
+        self._restored_storage_state_context_ids: set[int] = set()
+
+    def _effective_browser_mode(self) -> str:
+        if self._global_browser_manager is not None:
+            mode = getattr(self._global_browser_manager, "current_mode", "")
+            if mode:
+                return str(mode)
+        return self.browser_mode
+
+    def _detect_non_product_page(self, current_url: str, title: str, body_text: str) -> str:
+        detector = getattr(self, "DETECT_NON_PRODUCT_PAGE_FN", detect_non_product_page)
+        return str(detector(current_url, title, body_text) or "")
 
     @staticmethod
     def _price_from_text(raw: str) -> float | None:
@@ -636,6 +865,13 @@ class Crawler:
         )
         if not normalized:
             return []
+        if len(normalized) >= 2:
+            max_value = normalized[-1]
+            filtered_micro = [
+                v for v in normalized if not (v < 1 and max_value >= 5 and v <= max_value * 0.05)
+            ]
+            if filtered_micro:
+                normalized = filtered_micro
         if len(normalized) >= 2:
             median_value = float(statistics.median(normalized))
             if median_value >= 30:
@@ -693,6 +929,185 @@ class Crawler:
             "alihealth",
         )
         return any(token in text for token in bad_tokens)
+
+    @staticmethod
+    def _is_non_product_image_context(text: str) -> bool:
+        value = clean_text(str(text or ""), max_len=240).lower()
+        if not value:
+            return False
+        bad_tokens = (
+            "88vip",
+            "会员",
+            "礼券",
+            "礼遇",
+            "优惠",
+            "券后",
+            "顺丰",
+            "速达",
+            "退货",
+            "无理由",
+            "运费险",
+            "售后",
+            "物流",
+            "直供",
+            "原装正品",
+            "假一赔",
+            "服务保障",
+        )
+        return any(token in value for token in bad_tokens)
+
+    @staticmethod
+    def _is_noise_detail_text(text: str) -> bool:
+        raw = str(text or "").replace("\r", " ").replace("\n", " ").strip()
+        if not raw:
+            return True
+        value = re.sub(r"\s+", " ", raw)[:240]
+        lowered = value.lower()
+        if any(token in lowered for token in ("tmall.com", "taobao.com", "http://", "https://")):
+            return True
+        if "�" in value:
+            return True
+        hard_tokens = (
+            "我的淘宝",
+            "购物车",
+            "收藏夹",
+            "免费开店",
+            "千牛卖家中心",
+            "帮助中心",
+            "联系客服",
+            "网站导航",
+            "登录",
+            "注册",
+            "language",
+            "无障碍",
+            "亲，请登录",
+            "天猫超市",
+            "淘宝网首页",
+        )
+        if any(token in value for token in hard_tokens):
+            return True
+        nav_tokens = (
+            "首页",
+            "店铺",
+            "客服",
+            "收藏",
+            "优惠券",
+            "会员",
+            "活动",
+            "规则",
+            "物流",
+            "售后",
+            "退货",
+        )
+        nav_hit_count = sum(1 for token in nav_tokens if token in value)
+        if nav_hit_count >= 3:
+            return True
+        if len(value) <= 16 and nav_hit_count >= 2:
+            return True
+        return False
+
+    @classmethod
+    def _is_relevant_detail_dom_image_row(cls, row: dict[str, Any]) -> bool:
+        src = cls._normalize_image_url(str(row.get("src", "") or row.get("content", "")))
+        if not src:
+            return False
+        alt = str(row.get("alt", "") or "")
+        css = str(row.get("class_name", "") or "")
+        context_text = str(row.get("context_text", "") or "")
+        lower = src.lower()
+        width = int(float(row.get("width", 0) or 0))
+        height = int(float(row.get("height", 0) or 0))
+        if cls._is_noise_image(src, alt, css):
+            return False
+        if lower.endswith("/s.gif") or lower.endswith("s.gif"):
+            return False
+        if any(token in lower for token in ("service", "refund", "coupon", "vip")):
+            return False
+        if width and height and min(width, height) < 180:
+            return False
+        if width and height and width / max(height, 1) >= 3.2:
+            return False
+        if cls._is_non_product_image_context(" ".join([alt, css, context_text])):
+            return False
+        return True
+
+    @staticmethod
+    def _is_tail_banner_image_row(row: dict[str, Any]) -> bool:
+        width = int(float(row.get("width", 0) or 0))
+        height = int(float(row.get("height", 0) or 0))
+        if not width or not height:
+            return False
+        return width >= 600 and (width / max(height, 1) >= 3.2 or height <= 260)
+
+    @classmethod
+    def _is_tail_noise_image_row(cls, row: dict[str, Any]) -> bool:
+        src = cls._normalize_image_url(str(row.get("src", "") or row.get("content", "")))
+        alt = str(row.get("alt", "") or "")
+        css = str(row.get("class_name", "") or "")
+        context_text = str(row.get("context_text", "") or "")
+        lower = src.lower()
+        width = int(float(row.get("width", 0) or 0))
+        height = int(float(row.get("height", 0) or 0))
+        ratio = width / max(height, 1) if width and height else 0.0
+        if cls._is_non_product_image_context(" ".join([alt, css, context_text])):
+            return True
+        if any(
+            token in lower
+            for token in (
+                "service",
+                "refund",
+                "vip",
+                "wuying",
+                "barrier",
+                "accessible",
+                "green",
+                "carbon",
+            )
+        ):
+            return True
+        if width and height and min(width, height) < 180:
+            return True
+        if width >= 240 and height <= 320 and ratio >= 2.0:
+            return True
+        return False
+
+    @classmethod
+    def _trim_non_product_tail_image_rows(
+        cls, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if len(rows) < 4:
+            return rows
+        trim_index: int | None = None
+        start = max(0, len(rows) - 8)
+        for idx in range(start, len(rows)):
+            suffix = rows[idx:]
+            banner_count = sum(1 for row in suffix if cls._is_tail_banner_image_row(row))
+            if len(suffix) >= 4 and banner_count >= max(3, len(suffix) - 1):
+                trim_index = idx
+                break
+        if trim_index is None:
+            trimmed_rows = rows
+        else:
+            if trim_index > 0 and len(rows) - trim_index >= 4:
+                prev = rows[trim_index - 1]
+                prev_width = int(float(prev.get("width", 0) or 0))
+                prev_height = int(float(prev.get("height", 0) or 0))
+                prev_ratio = prev_width / max(prev_height, 1) if prev_width and prev_height else 0.0
+                if (
+                    prev_width >= 600
+                    and 600 <= prev_height <= 1000
+                    and 0.7 <= prev_ratio <= 1.4
+                ):
+                    trim_index -= 1
+            trimmed_rows = rows[:trim_index]
+        end = len(trimmed_rows)
+        trimmed_tail = 0
+        while end > 0 and cls._is_tail_noise_image_row(trimmed_rows[end - 1]):
+            end -= 1
+            trimmed_tail += 1
+        if trimmed_tail >= 2:
+            return trimmed_rows[:end]
+        return trimmed_rows
 
     @classmethod
     def _pick_main_image(cls, images: list[dict[str, Any]]) -> str:
@@ -924,6 +1339,7 @@ class Crawler:
         image_meta: list[dict[str, Any]],
         image_urls: list[str],
         detail_blocks_override: list[dict[str, str]] | None = None,
+        visit_chain: list[dict[str, str]] | None = None,
     ) -> ItemDetail:
         image_urls = [str(u) for u in image_urls if isinstance(u, str)]
         main_image_url = self._pick_main_image(image_meta)
@@ -1012,6 +1428,7 @@ class Crawler:
             detail_blocks=detail_blocks,
             citations=citations,
             crawl_time=crawl_time,
+            visit_chain=list(visit_chain or []),
             error="",
         )
 
@@ -1021,6 +1438,24 @@ class Crawler:
             await context.storage_state(path=str(self.storage_state_file))
         except Exception:
             return
+
+    async def _restore_storage_state_async(self, context: Any) -> None:
+        context_key = id(context)
+        if context_key in self._restored_storage_state_context_ids:
+            return
+        normalized = _read_storage_state_cookies(self.storage_state_file)
+        if not normalized:
+            return
+        try:
+            await context.add_cookies(normalized)
+            self._restored_storage_state_context_ids.add(context_key)
+            LOG.info(
+                "Restored %s cookies from storage state %s",
+                len(normalized),
+                self.storage_state_file,
+            )
+        except Exception as exc:
+            LOG.warning("Failed to restore cookies from %s: %s", self.storage_state_file, exc)
 
     async def _read_page_snapshot_async(self, page: Any) -> tuple[str, str, str]:
         current_url = page.url or ""
@@ -1043,35 +1478,39 @@ class Crawler:
         item_id: str,
     ) -> bool:
         current_url, title, body_text = await self._read_page_snapshot_async(page)
-        reason = detect_non_product_page(current_url, title, body_text)
+        reason = self._detect_non_product_page(current_url, title, body_text)
         if not reason:
             return False
 
-        LOG.warning("Detected blocked page during %s for item %s: %s", stage, item_id, reason)
-        login_handler = TaobaoLogin(
+        LOG.warning(
+            "[%s] Detected blocked page during %s for item %s: %s",
+            self.PLATFORM_LABEL,
+            stage,
+            item_id,
+            reason,
+        )
+        login_handler = self.LOGIN_HANDLER_CLS(
             browser_context=context,
             context_page=page,
             login_timeout_sec=self.manual_login_timeout_sec,
         )
         login_result: LoginHandleResult = await login_handler.check_and_handle_login()
         self.login_recovery_events.append(
-            {
-                "source": "crawl",
-                "stage": stage,
-                "item_id": item_id,
-                "ok": bool(login_result.ok),
-                "blocked_reason": reason,
-                "final_state": login_result.final_state,
-                "reason": login_result.reason,
-                "elapsed_sec": round(float(login_result.elapsed_sec), 3),
-                "url": current_url,
-                "decision_trace": login_result.decision_trace,
-                "updated_at": now_iso(),
-            }
+            _build_login_recovery_event(
+                source="crawl",
+                stage=stage,
+                blocked_reason=reason,
+                current_url=current_url,
+                login_result=login_result,
+                browser_mode=self._effective_browser_mode(),
+                storage_state_file=self.storage_state_file,
+                user_data_dir=self.user_data_dir,
+                item_id=item_id,
+            )
         )
         if not login_result.ok:
             raise RuntimeError(
-                f"Login timeout in {stage} for item {item_id}: "
+                f"{self.PLATFORM_LABEL} login timeout in {stage} for item {item_id}: "
                 f"{reason} ({login_result.reason})"
             )
 
@@ -1106,7 +1545,7 @@ class Crawler:
 
     async def _extract_detail_payload_from_target(
         self, target: Any
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, Any]:
         script = """
 () => {
   const selectors = [
@@ -1149,6 +1588,7 @@ class Crawler:
   };
   const images = [];
   const imageSeen = new Set();
+  const imageRows = [];
   for (const img of root.querySelectorAll('img')) {
     let src = readAttr(img, ['src', 'data-src', 'data-ks-lazyload', 'data-lazy-src', 'data-original']) || String(img.currentSrc || '').trim();
     if (!src) continue;
@@ -1156,21 +1596,42 @@ class Crawler:
     if (!/^https?:\\/\\//i.test(src)) continue;
     if (imageSeen.has(src)) continue;
     imageSeen.add(src);
+    const rect = img.getBoundingClientRect();
+    let contextText = '';
+    let parent = img;
+    for (let depth = 0; depth < 4 && parent; depth += 1) {
+      parent = parent.parentElement;
+      if (!parent) break;
+      const raw = String(parent.innerText || parent.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (raw && raw.length >= 6) {
+        contextText = raw.slice(0, 200);
+        break;
+      }
+    }
     images.push(src);
+    imageRows.push({
+      src,
+      alt: String(img.alt || '').trim(),
+      class_name: String(img.className || '').trim(),
+      width: Number(img.naturalWidth || img.width || rect.width || 0),
+      height: Number(img.naturalHeight || img.height || rect.height || 0),
+      context_text: contextText
+    });
     if (images.length >= 40) break;
   }
-  return { texts, images };
+  return { texts, images, image_rows: imageRows };
 }
 """
         try:
             payload = await target.evaluate(script)
         except Exception:
-            return {"texts": [], "images": []}
+            return {"texts": [], "images": [], "image_rows": []}
         if not isinstance(payload, dict):
-            return {"texts": [], "images": []}
+            return {"texts": [], "images": [], "image_rows": []}
         texts = [str(v) for v in payload.get("texts", []) if isinstance(v, str)]
         images = [str(v) for v in payload.get("images", []) if isinstance(v, str)]
-        return {"texts": texts, "images": images}
+        image_rows = [v for v in payload.get("image_rows", []) if isinstance(v, dict)]
+        return {"texts": texts, "images": images, "image_rows": image_rows}
 
     async def _collect_detail_blocks_from_page(
         self, page: Any, item_id: str, image_dir: Path
@@ -1193,9 +1654,11 @@ class Crawler:
 
         texts: list[str] = []
         images: list[str] = []
+        image_rows: list[dict[str, Any]] = []
         payload = await self._extract_detail_payload_from_target(page)
         texts.extend(payload.get("texts", []))
         images.extend(payload.get("images", []))
+        image_rows.extend(payload.get("image_rows", []))
 
         for frame in page.frames:
             if frame == page.main_frame:
@@ -1209,6 +1672,7 @@ class Crawler:
             frame_payload = await self._extract_detail_payload_from_target(frame)
             texts.extend(frame_payload.get("texts", []))
             images.extend(frame_payload.get("images", []))
+            image_rows.extend(frame_payload.get("image_rows", []))
 
         cleaned_texts: list[str] = []
         seen_text: set[str] = set()
@@ -1217,6 +1681,8 @@ class Crawler:
             if len(text) < 6:
                 continue
             if not re.search(r"[\u4e00-\u9fff]", text):
+                continue
+            if self._is_noise_detail_text(text):
                 continue
             if text in seen_text:
                 continue
@@ -1227,9 +1693,16 @@ class Crawler:
 
         cleaned_images: list[str] = []
         seen_image: set[str] = set()
-        for raw in images:
-            normalized = self._normalize_image_url(raw)
+        candidate_image_rows: list[dict[str, Any]] = image_rows or [
+            {"src": raw, "alt": "", "class_name": "", "width": 0, "height": 0, "context_text": ""}
+            for raw in images
+        ]
+        candidate_image_rows = self._trim_non_product_tail_image_rows(candidate_image_rows)
+        for row in candidate_image_rows:
+            normalized = self._normalize_image_url(str(row.get("src", "") or row.get("content", "")))
             if not normalized or normalized in seen_image:
+                continue
+            if not self._is_relevant_detail_dom_image_row(row):
                 continue
             seen_image.add(normalized)
             cleaned_images.append(normalized)
@@ -1303,6 +1776,7 @@ class Crawler:
         image_meta: list[dict[str, Any]] = []
         current_url = ""
         detail_blocks: list[dict[str, str]] = []
+        visit_chain: list[dict[str, str]] = []
 
         def _is_retryable_navigation_error(message: str) -> bool:
             text = (message or "").lower()
@@ -1333,13 +1807,30 @@ class Crawler:
                 browser_context = global_manager.browser_context
                 if browser_context is None:
                     raise RuntimeError("global browser context is unavailable")
+                await self._restore_storage_state_async(browser_context)
 
                 # Each crawl should use an isolated page to avoid cross-task navigation interruption.
                 page = await global_manager.new_page()
 
+                async def _capture_visit(stage: str, note: str = "") -> None:
+                    current_visit_url, current_visit_title, _ = await self._read_page_snapshot_async(page)
+                    if not current_visit_url:
+                        return
+                    event = {"stage": stage, "url": str(current_visit_url)}
+                    title_text = clean_text(str(current_visit_title or ""), max_len=120)
+                    note_text = clean_text(str(note or ""), max_len=160)
+                    if title_text:
+                        event["title"] = title_text
+                    if note_text:
+                        event["note"] = note_text
+                    if visit_chain and visit_chain[-1].get("stage") == event["stage"] and visit_chain[-1].get("url") == event["url"]:
+                        return
+                    visit_chain.append(event)
+
                 # Navigate to the item page
                 await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
                 await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
+                await _capture_visit("item_initial", note="initial goto")
 
                 # Check for non-product page (login required, blocked, etc.)
                 login_handled = await self._handle_login_if_needed_async(
@@ -1349,15 +1840,43 @@ class Crawler:
                     item_id=item_id,
                 )
                 if login_handled:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-                    await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
-                    retry_url, retry_title, retry_body = await self._read_page_snapshot_async(page)
-                    retry_reason = detect_non_product_page(retry_url, retry_title, retry_body)
-                    if retry_reason:
-                        raise RuntimeError(
-                            f"taobao item page blocked after login recovery: {retry_reason}. "
-                            f"Please ensure you are logged in and complete QR verification."
+                    recovered_url, recovered_title, recovered_body = await self._read_page_snapshot_async(page)
+                    recovered_reason = self._detect_non_product_page(
+                        recovered_url,
+                        recovered_title,
+                        recovered_body,
+                    )
+                    recovered_rec = normalize_url(recovered_url)
+                    target_rec = normalize_url(url)
+                    same_item_surface = bool(
+                        recovered_rec
+                        and target_rec
+                        and recovered_rec.platform == target_rec.platform
+                        and recovered_rec.item_id == target_rec.item_id
+                    )
+                    if not recovered_reason and same_item_surface:
+                        await _capture_visit(
+                            "item_after_login_recovery",
+                            note="reused post-login detail page without reload",
                         )
+                    else:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+                        await page.wait_for_timeout(max(4500, self.manual_wait_seconds * 1000))
+                        await _capture_visit(
+                            "item_after_login_recovery",
+                            note="reloaded after login recovery",
+                        )
+                        retry_url, retry_title, retry_body = await self._read_page_snapshot_async(page)
+                        retry_reason = self._detect_non_product_page(
+                            retry_url,
+                            retry_title,
+                            retry_body,
+                        )
+                        if retry_reason:
+                            raise RuntimeError(
+                                f"taobao item page blocked after login recovery: {retry_reason}. "
+                                f"Please ensure you are logged in and complete QR verification."
+                            )
 
                 # Scroll down to load all content
                 scroll_rounds = max(4, 4 + (self.manual_wait_seconds // 4))
@@ -1396,6 +1915,7 @@ class Crawler:
                 html = await page.content()
                 body_text = await page.inner_text("body")
                 title = await page.title()
+                await _capture_visit("item_ready", note="detail page ready for extraction")
 
                 # Extract image metadata
                 image_meta = await page.eval_on_selector_all(
@@ -1435,6 +1955,7 @@ class Crawler:
                     image_meta=image_meta,
                     image_urls=image_urls,
                     detail_blocks_override=detail_blocks or None,
+                    visit_chain=visit_chain,
                 )
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
@@ -1463,6 +1984,7 @@ class Crawler:
                     detail_blocks=[],
                     citations=[],
                     crawl_time=crawl_time,
+                    visit_chain=visit_chain,
                     error=error,
                 )
             finally:

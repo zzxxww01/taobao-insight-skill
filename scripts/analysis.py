@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
 import statistics
 import textwrap
+import time
+import threading
+import uuid
 from contextlib import contextmanager
 from html import escape as html_escape, unescape as html_unescape
 from pathlib import Path
@@ -35,6 +39,181 @@ LOG = logging.getLogger("taobao_insight")
 
 class TransientGeminiError(RuntimeError):
     """Raised for temporary Gemini API errors that should be retried."""
+
+
+class _GeminiKeyPool:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_index = 0
+        self._cooldowns: dict[str, float] = {}
+
+    def ordered_keys(self, keys: list[str]) -> list[tuple[str, str]]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in keys:
+            key = str(raw or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+        if not normalized:
+            return []
+        with self._lock:
+            start = self._next_index % len(normalized)
+            self._next_index = (self._next_index + 1) % len(normalized)
+            ordered = normalized[start:] + normalized[:start]
+            now = time.time()
+            ready = [key for key in ordered if self._cooldowns.get(key, 0.0) <= now]
+            cooling = [key for key in ordered if self._cooldowns.get(key, 0.0) > now]
+        final_order = ready + cooling
+        return [
+            (key, "primary" if idx == 0 else f"alternate_{idx}")
+            for idx, key in enumerate(final_order)
+        ]
+
+    def mark_transient(self, key: str, cooldown_sec: int = 90) -> None:
+        if not key:
+            return
+        with self._lock:
+            self._cooldowns[key] = time.time() + max(30, int(cooldown_sec))
+
+    def mark_success(self, key: str) -> None:
+        if not key:
+            return
+        with self._lock:
+            self._cooldowns.pop(key, None)
+
+
+_GEMINI_KEY_POOL = _GeminiKeyPool()
+
+
+def _split_env_key_list(raw_value: str) -> list[str]:
+    if not raw_value:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in re.split(r"[\s,;]+", str(raw_value or "").strip()):
+        value = token.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _collect_gemini_keys(primary_key: str) -> list[str]:
+    keys: list[str] = []
+    for key in [primary_key]:
+        value = str(key or "").strip()
+        if value:
+            keys.append(value)
+    for env_name in ("GEMINI_API_KEYS", "GEMINI_API_KEY_FALLBACK", "GEMINI_API_KEY_ALT"):
+        keys.extend(_split_env_key_list(os.getenv(env_name, "")))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+def _mask_api_key(api_key: str) -> str:
+    value = str(api_key or "").strip()
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _gemini_debug_dir() -> Path | None:
+    raw = os.getenv("TAOBAO_INSIGHT_GEMINI_DEBUG_DIR", "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _serialize_gemini_contents_for_debug(contents: Any) -> list[dict[str, Any]]:
+    items = contents if isinstance(contents, list) else [contents]
+    serialized: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            data = item.get("data")
+            mime_type = clean_text(str(item.get("mime_type", "")), max_len=80)
+            if isinstance(data, (bytes, bytearray)):
+                payload = bytes(data)
+                serialized.append(
+                    {
+                        "kind": "inline_data",
+                        "mime_type": mime_type or "application/octet-stream",
+                        "byte_length": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+                continue
+        if isinstance(item, (bytes, bytearray)):
+            payload = bytes(item)
+            serialized.append(
+                {
+                    "kind": "inline_data",
+                    "mime_type": "application/octet-stream",
+                    "byte_length": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+            continue
+        serialized.append({"kind": "text", "text": str(item or "")})
+    return serialized
+
+
+def _dump_gemini_debug_record(
+    *,
+    model: str,
+    contents: Any,
+    backend: str,
+    response_text: str = "",
+    error: str = "",
+    debug_meta: dict[str, Any] | None = None,
+    api_key_alias: str = "",
+    api_key_mask: str = "",
+) -> None:
+    target_dir = _gemini_debug_dir()
+    if target_dir is None:
+        return
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        serialized_contents = _serialize_gemini_contents_for_debug(contents)
+        text_parts = [
+            str(part.get("text", ""))
+            for part in serialized_contents
+            if part.get("kind") == "text"
+        ]
+        payload = {
+            "ts": now_iso(),
+            "backend": backend,
+            "model": model,
+            "api_key_alias": api_key_alias or "",
+            "api_key_mask": api_key_mask or "",
+            "debug_meta": debug_meta or {},
+            "has_binary_parts": any(
+                part.get("kind") == "inline_data" for part in serialized_contents
+            ),
+            "text_part_count": len(text_parts),
+            "text_parts": text_parts,
+            "contents": serialized_contents,
+            "response_text": response_text or "",
+            "error": error or "",
+        }
+        filename = (
+            f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:10]}-"
+            f"{re.sub(r'[^a-zA-Z0-9._-]+', '-', model or 'gemini').strip('-') or 'gemini'}.json"
+        )
+        (target_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        LOG.warning("Failed to dump Gemini debug record: %s", exc)
 
 
 def _is_transient_gemini_exception(exc: Exception) -> bool:
@@ -136,9 +315,10 @@ def gemini_generate_json_text(
     proxy_url: str = "",
     timeout_sec: int = 45,
     raise_on_transient: bool = False,
+    debug_meta: dict[str, Any] | None = None,
 ) -> str:
-    key = (api_key or "").strip()
-    if not key:
+    keys = _collect_gemini_keys(api_key)
+    if not keys:
         LOG.error(f"Gemini API key is missing. Skipping API call to {model}.")
         return ""
 
@@ -150,57 +330,122 @@ def gemini_generate_json_text(
             google_genai = None
             genai_types = None
 
-        if google_genai is not None and genai_types is not None:
-            try:
-                client_kwargs: dict[str, Any] = {"api_key": key}
+        last_error: Exception | None = None
+        transient_error: Exception | None = None
+        ordered_keys = _GEMINI_KEY_POOL.ordered_keys(keys)
+        for index, (key, key_alias) in enumerate(ordered_keys, start=1):
+            key_mask = _mask_api_key(key)
+            key_errors: list[Exception] = []
+
+            if google_genai is not None and genai_types is not None:
                 try:
-                    timeout_ms = max(5_000, int(timeout_sec * 1000))
-                    client_kwargs["http_options"] = genai_types.HttpOptions(
-                        timeout=timeout_ms
+                    client_kwargs: dict[str, Any] = {"api_key": key}
+                    try:
+                        timeout_ms = max(5_000, int(timeout_sec * 1000))
+                        client_kwargs["http_options"] = genai_types.HttpOptions(
+                            timeout=timeout_ms
+                        )
+                    except Exception:
+                        pass
+
+                    client = google_genai.Client(**client_kwargs)
+                    genai_contents = _build_genai_contents(contents, genai_types)
+                    config = genai_types.GenerateContentConfig(
+                        responseMimeType="application/json"
                     )
-                except Exception:
-                    pass
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=genai_contents,
+                        config=config,
+                    )
+                    text = _extract_text_from_genai_response(response)
+                    _dump_gemini_debug_record(
+                        model=model,
+                        contents=contents,
+                        backend="google.genai",
+                        response_text=text or "",
+                        debug_meta=debug_meta,
+                        api_key_alias=key_alias,
+                        api_key_mask=key_mask,
+                    )
+                    _GEMINI_KEY_POOL.mark_success(key)
+                    return text or ""
+                except Exception as exc:
+                    key_errors.append(exc)
+                    _dump_gemini_debug_record(
+                        model=model,
+                        contents=contents,
+                        backend="google.genai",
+                        error=str(exc),
+                        debug_meta=debug_meta,
+                        api_key_alias=key_alias,
+                        api_key_mask=key_mask,
+                    )
 
-                client = google_genai.Client(**client_kwargs)
-                genai_contents = _build_genai_contents(contents, genai_types)
-                config = genai_types.GenerateContentConfig(
-                    responseMimeType="application/json"
+            try:
+                import google.generativeai as legacy_genai
+
+                legacy_genai.configure(api_key=key)
+                legacy_model = legacy_genai.GenerativeModel(model)
+                response = legacy_model.generate_content(
+                    contents,
+                    generation_config={"response_mime_type": "application/json"},
+                    request_options={"timeout": max(5, int(timeout_sec))},
                 )
-                response = client.models.generate_content(
+                text = (response.text or "").strip()
+                _dump_gemini_debug_record(
                     model=model,
-                    contents=genai_contents,
-                    config=config,
+                    contents=contents,
+                    backend="google.generativeai",
+                    response_text=text,
+                    debug_meta=debug_meta,
+                    api_key_alias=key_alias,
+                    api_key_mask=key_mask,
                 )
-                text = _extract_text_from_genai_response(response)
-                return text or ""
-            except Exception as e:
-                if raise_on_transient and _is_transient_gemini_exception(e):
-                    raise TransientGeminiError(str(e)) from e
+                _GEMINI_KEY_POOL.mark_success(key)
+                return text
+            except Exception as exc:
+                key_errors.append(exc)
+                _dump_gemini_debug_record(
+                    model=model,
+                    contents=contents,
+                    backend="google.generativeai",
+                    error=str(exc),
+                    debug_meta=debug_meta,
+                    api_key_alias=key_alias,
+                    api_key_mask=key_mask,
+                )
+
+            for exc in key_errors:
+                last_error = exc
+                if _is_transient_gemini_exception(exc):
+                    transient_error = exc
+            if transient_error and any(
+                _is_transient_gemini_exception(exc) for exc in key_errors
+            ):
+                _GEMINI_KEY_POOL.mark_transient(key)
+                if len(ordered_keys) > 1 and index < len(ordered_keys):
+                    LOG.warning(
+                        "Gemini key %s hit transient limit; switching key for model %s",
+                        key_alias,
+                        model,
+                    )
+                    continue
+            else:
+                _GEMINI_KEY_POOL.mark_success(key)
+            if last_error is not None:
                 LOG.error(
-                    "Failed to generate content with google.genai: %s", e, exc_info=True
+                    "Failed to generate content with Gemini (%s via %s): %s",
+                    model,
+                    key_alias,
+                    last_error,
+                    exc_info=True,
                 )
-                return ""
+                break
 
-        try:
-            import google.generativeai as legacy_genai
-
-            legacy_genai.configure(api_key=key)
-            legacy_model = legacy_genai.GenerativeModel(model)
-            response = legacy_model.generate_content(
-                contents,
-                generation_config={"response_mime_type": "application/json"},
-                request_options={"timeout": max(5, int(timeout_sec))},
-            )
-            return (response.text or "").strip()
-        except Exception as e:
-            if raise_on_transient and _is_transient_gemini_exception(e):
-                raise TransientGeminiError(str(e)) from e
-            LOG.error(
-                "Failed to generate content with legacy google.generativeai: %s",
-                e,
-                exc_info=True,
-            )
-            return ""
+        if raise_on_transient and transient_error is not None:
+            raise TransientGeminiError(str(transient_error)) from transient_error
+        return ""
 
 
 class SellingPointExtractor:
@@ -219,6 +464,57 @@ class SellingPointExtractor:
         self.gemini_proxy_url = gemini_proxy_url.strip()
         self.gemini_timeout_sec = max(5, int(gemini_timeout_sec))
         self.gemini_raise_on_transient = bool(gemini_raise_on_transient)
+        try:
+            self.gemini_image_max_candidates = max(
+                6, int(os.getenv("GEMINI_IMAGE_MAX_CANDIDATES", "24"))
+            )
+        except ValueError:
+            self.gemini_image_max_candidates = 24
+        try:
+            self.gemini_image_batch_max_images = max(
+                1, int(os.getenv("GEMINI_IMAGE_BATCH_MAX_IMAGES", "8"))
+            )
+        except ValueError:
+            self.gemini_image_batch_max_images = 8
+        try:
+            self.gemini_image_batch_max_bytes = max(
+                1_000_000, int(os.getenv("GEMINI_IMAGE_BATCH_MAX_BYTES", str(18 * 1024 * 1024)))
+            )
+        except ValueError:
+            self.gemini_image_batch_max_bytes = 18 * 1024 * 1024
+
+    @staticmethod
+    def _platform_key(item_context: dict[str, str]) -> str:
+        return clean_text(str(item_context.get("platform", "")), max_len=20).lower()
+
+    @staticmethod
+    def _platform_name(item_context: dict[str, str]) -> str:
+        platform = SellingPointExtractor._platform_key(item_context)
+        if platform == "jd":
+            return "京东"
+        if platform == "taobao":
+            return "淘宝"
+        return "电商"
+
+    @staticmethod
+    def _detail_term(item_context: dict[str, str]) -> str:
+        platform = SellingPointExtractor._platform_key(item_context)
+        if platform == "taobao":
+            return "图文详情"
+        return "商品详情"
+
+    @staticmethod
+    def _detail_reference_label(item_context: dict[str, str]) -> str:
+        if SellingPointExtractor._platform_key(item_context) == "taobao":
+            return "图文详情参考图："
+        return "商品详情参考图："
+
+    @staticmethod
+    def _detail_citation_label(item_platform: str) -> str:
+        platform = clean_text(str(item_platform or ""), max_len=20).lower()
+        if platform == "taobao":
+            return "图文详情页引用："
+        return "商品详情引用："
 
     @staticmethod
     def _is_noise_point_text(text: str) -> bool:
@@ -249,6 +545,30 @@ class SellingPointExtractor:
             "赠品",
         )
         lowered = value.lower()
+        extra_non_product_tokens = (
+            "???",
+            "???",
+            "?????????",
+            "????",
+            "???",
+            "???",
+            "???",
+            "??????",
+            "??????",
+            "??????",
+            "??????",
+            "??????",
+            "???",
+            "????",
+            "???",
+            "???",
+            "????",
+            "??????",
+            "????",
+            "???",
+        )
+        if any(token in lowered for token in extra_non_product_tokens):
+            return True
         if any(token in value for token in noise_tokens):
             return True
         if any(
@@ -275,6 +595,32 @@ class SellingPointExtractor:
             "赠品",
             "活动",
         )
+        extra_service_tokens = (
+            "顺丰",
+            "速达",
+            "退货",
+            "无理由",
+            "顾问",
+            "咨询",
+            "物流",
+            "服务",
+            "礼券",
+            "礼遇",
+            "官方直供",
+            "原装正品",
+            "线上专属",
+            "伪素颜",
+            "氛围感",
+            "送女友",
+            "女神礼物",
+            "生日礼物",
+            "38节",
+            "销售额第一",
+            "销量第一",
+            "排名第一",
+        )
+        if any(token in value for token in extra_service_tokens):
+            return True
         return any(token in value for token in promo_tokens)
 
     @staticmethod
@@ -315,7 +661,10 @@ class SellingPointExtractor:
                 if len(unique_refs) >= 6:
                     break
             if unique_refs:
-                rows.append("图文详情参考图：" + "、".join(unique_refs))
+                rows.append(
+                    SellingPointExtractor._detail_reference_label(item_context)
+                    + "、".join(unique_refs)
+                )
         return "；".join(rows)
 
     @staticmethod
@@ -365,40 +714,61 @@ class SellingPointExtractor:
     def _build_prompt(
         item_context: dict[str, str], detail_blocks: list[dict[str, str]]
     ) -> str:
+        detail_term = SellingPointExtractor._detail_term(item_context)
+        platform_name = SellingPointExtractor._platform_name(item_context)
+        price_text = clean_text(str(item_context.get("price_text", "")), max_len=120)
+        sku_summary = clean_text(str(item_context.get("sku_summary", "")), max_len=240)
         lines: list[str] = []
-        for block in detail_blocks[:80]:
-            lines.append(
-                f"- {block.get('source_ref', '')} | {block.get('source_type', '')} | {clean_text(block.get('content', ''), max_len=220)}"
-            )
-        payload = "\n".join(lines)
+        for block in detail_blocks:
+            source_type = clean_text(str(block.get("source_type", "")), max_len=20).lower()
+            if source_type != "text":
+                continue
+            raw_content = str(block.get("content", "") or "")
+            content = clean_text(raw_content, max_len=220)
+            if any(
+                token in raw_content
+                for token in (
+                    "我的淘宝",
+                    "购物车",
+                    "收藏夹",
+                    "免费开店",
+                    "千牛卖家中心",
+                    "帮助中心",
+                    "无障碍",
+                )
+            ):
+                continue
+            if not content or SellingPointExtractor._is_noise_point_text(content):
+                continue
+            lines.append(f"- {block.get('source_ref', '')} | text | {content}")
+            if len(lines) >= 40:
+                break
+        payload = "\n".join(lines) or "\u65e0\u53ef\u9760\u6587\u672c\u8bc1\u636e"
         return textwrap.dedent(
             f"""
-            你是资深美妆电商策略分析师，请从图文详情中抽取“可被消费者感知的产品卖点”，并严格引用证据。
-
-            商品上下文:
+            \u4f60\u662f\u8d44\u6df1{platform_name}\u5546\u54c1\u7814\u7a76\u5206\u6790\u5e08\u3002\u8bf7\u53ea\u4f9d\u636e\u7ed9\u5b9a{detail_term}\u6587\u672c\u8bc1\u636e\uff0c\u63d0\u70bc\u6d88\u8d39\u8005\u53ef\u76f4\u63a5\u611f\u77e5\u7684\u5546\u54c1\u5356\u70b9\u3002
+            \u5546\u54c1\u4e0a\u4e0b\u6587\uff1a
+            - item_id: {item_context.get("item_id", "")}
+            - platform: {platform_name}
             - title: {item_context.get("title", "")}
             - brand: {item_context.get("brand", "")}
             - shop_name: {item_context.get("shop_name", "")}
+            - price: {price_text}
+            - sku_summary: {sku_summary}
 
-            详情证据块（source_ref | source_type | content）:
+            {detail_term}\u6587\u672c\u8bc1\u636e\uff08source_ref | source_type | content\uff09\uff1a
             {payload}
 
-            抽取原则:
-            1) 只依据给定证据，不得补充外部常识，不得推断未出现的信息。
-            2) 卖点必须是“消费者价值表达”，优先功效/妆效/肤感/场景/人群适配。
-            3) 禁止空泛措辞（如“质量好”“口碑好”）与纯营销话术。
-            4) 每条必须绑定 citation，且 citation 必须来自上述 source_ref。
-            5) 去重并控制在 4-8 条，中文精炼表达，每条 <= 28 字。
-
-            仅输出 JSON 数组，不要输出任何其他文字。元素结构:
-            [
-              {{
-                "point": "卖点文本",
-                "citation": "text_1",
-                "consumer_value": "解决了什么问题",
-                "scenario": "适用场景或人群"
-              }}
-            ]
+            \u7ea6\u675f\uff1a
+            1) \u53ea\u80fd\u5f15\u7528\u7ed9\u5b9a\u8bc1\u636e\uff0c\u4e0d\u5f97\u8865\u5145\u5916\u90e8\u5e38\u8bc6\u3002
+            2) \u5982\u679c\u8bc1\u636e\u4e0d\u8db3\uff0c\u5b81\u53ef\u5c11\u5199\uff1b\u5b8c\u5168\u4e0d\u8db3\u65f6\u8fd4\u56de []\u3002
+            3) \u5356\u70b9\u5fc5\u987b\u662f\u6d88\u8d39\u8005\u53ef\u76f4\u63a5\u611f\u77e5\u7684\u8868\u8fbe\uff0c\u4f18\u5148\u5986\u6548\u3001\u80a4\u611f\u3001\u6750\u8d28\u3001\u89c4\u683c\u7ec4\u5408\u3001\u793c\u8d60\u4fe1\u606f\u3002
+            4) \u5ffd\u7565\u5e73\u53f0\u5bfc\u822a\u3001\u5e97\u94fa\u5165\u53e3\u3001\u7269\u6d41\u552e\u540e\u3001\u4f1a\u5458\u6743\u76ca\u3001\u7eaf\u4fc3\u9500\u8bcd\u3001\u9875\u9762\u58f3\u4fe1\u606f\u3002
+            5) \u6bcf\u6761\u5fc5\u987b\u7ed1\u5b9a citation\uff0c\u4e14 citation \u5fc5\u987b\u6765\u81ea\u4e0a\u8ff0 source_ref\u3002
+            6) \u4e0d\u5141\u8bb8\u628a\u540c\u4e00\u53e5\u8bdd\u62c6\u6210\u591a\u4e2a\u8fd1\u4e49\u91cd\u590d\u5356\u70b9\uff1b\u53bb\u91cd\u540e\u63a7\u5236\u5728 2-6 \u6761\u3002
+            7) \u56fe\u7247\u91cc\u624d\u770b\u5f97\u5230\u7684\u4fe1\u606f\u4e0d\u8981\u5728\u8fd9\u91cc\u8f93\u51fa\u3002
+            \u4ec5\u8f93\u51fa JSON \u6570\u7ec4\uff1a
+            [{{"point": "\u4e1d\u7ed2\u96fe\u9762\u5986\u6548", "citation": "text_1"}}]
             """
         ).strip()
 
@@ -427,13 +797,19 @@ class SellingPointExtractor:
                 return b"", ""
         if not source.lower().startswith("http"):
             return b"", ""
+        lower = source.lower()
+        referer = ""
+        if any(token in lower for token in ("jd.com", "360buyimg", "jdimg", "3.cn")):
+            referer = "https://item.jd.com/"
+        elif any(token in lower for token in ("tmall", "taobao", "alicdn", "tbcdn")):
+            referer = "https://detail.tmall.com/"
+        headers = {"User-Agent": UA}
+        if referer:
+            headers["Referer"] = referer
         try:
             request = urllib.request.Request(
                 source,
-                headers={
-                    "User-Agent": UA,
-                    "Referer": "https://detail.tmall.com/",
-                },
+                headers=headers,
             )
             with urllib.request.urlopen(request, timeout=20) as response:
                 data = response.read()
@@ -470,11 +846,23 @@ class SellingPointExtractor:
             return []
         ranked: list[tuple[int, tuple[str, str, bytes]]] = []
         seen_refs: set[str] = set()
-        for block in image_blocks[:20]:
+        seen_sources: set[str] = set()
+        for block in image_blocks[: max(len(image_blocks), self.gemini_image_max_candidates * 2)]:
             ref = clean_text(str(block.get("source_ref", "")), max_len=24)
+            source = str(block.get("content", "") or "").strip().lower()
             if not ref or ref in seen_refs:
                 continue
+            source_key = source
+            if source_key and source_key in seen_sources:
+                continue
+            if any(
+                token in source
+                for token in ("/shaidan/", "default.image", "i.imageupload", "avatar", "comment", "review")
+            ):
+                continue
             seen_refs.add(ref)
+            if source_key:
+                seen_sources.add(source_key)
             data, mime = self._load_image_binary(str(block.get("content", "")))
             if not data:
                 continue
@@ -496,13 +884,36 @@ class SellingPointExtractor:
                 score += 1
             ranked.append((score, (ref, mime_norm or "image/jpeg", data)))
         ranked.sort(key=lambda item: (-item[0], self._ref_sort_key(item[1][0])))
-        return [row for _, row in ranked[:10]]
+        return [row for _, row in ranked[: self.gemini_image_max_candidates]]
+
+    def _split_image_candidate_batches(
+        self, candidates: list[tuple[str, str, bytes]]
+    ) -> list[list[tuple[str, str, bytes]]]:
+        if not candidates:
+            return []
+        batches: list[list[tuple[str, str, bytes]]] = []
+        current: list[tuple[str, str, bytes]] = []
+        current_bytes = 0
+        for row in candidates:
+            row_size = len(row[2])
+            over_image_cap = len(current) >= self.gemini_image_batch_max_images
+            over_byte_cap = current and (current_bytes + row_size > self.gemini_image_batch_max_bytes)
+            if current and (over_image_cap or over_byte_cap):
+                batches.append(current)
+                current = []
+                current_bytes = 0
+            current.append(row)
+            current_bytes += row_size
+        if current:
+            batches.append(current)
+        return batches
 
     def _generate_image_points_with_gemini(
         self,
         item_context: dict[str, str],
         candidates: list[tuple[str, str, bytes]],
         max_points: int = 8,
+        debug_meta: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
         if not self.gemini_api_key:
             return []
@@ -515,21 +926,29 @@ class SellingPointExtractor:
             parts.append(f"{ref}:")
             parts.append({"mime_type": mime or "image/jpeg", "data": data})
 
+        detail_term = self._detail_term(item_context)
+        platform_name = self._platform_name(item_context)
+        price_text = clean_text(str(item_context.get("price_text", "")), max_len=120)
+        sku_summary = clean_text(str(item_context.get("sku_summary", "")), max_len=240)
         prompt = textwrap.dedent(
             f"""
-            你是电商图文详情分析助手。请基于输入图片提炼商品卖点。
-            商品标题: {item_context.get("title", "")}
-            品牌: {item_context.get("brand", "")}
-            店铺: {item_context.get("shop_name", "")}
+            \u4f60\u662f{platform_name}{detail_term}\u56fe\u7247\u5206\u6790\u52a9\u624b\u3002\u8bf7\u53ea\u6839\u636e\u8f93\u5165\u56fe\u7247\uff0c\u63d0\u70bc\u5546\u54c1\u5356\u70b9\u3002
+            \u5546\u54c1ID: {item_context.get("item_id", "")}
+            \u5546\u54c1\u6807\u9898: {item_context.get("title", "")}
+            \u54c1\u724c: {item_context.get("brand", "")}
+            \u5e97\u94fa: {item_context.get("shop_name", "")}
+            \u4ef7\u683c: {price_text}
+            SKU \u6458\u8981: {sku_summary}
 
-            规则:
-            1) 只能依据图片信息，不得编造。
-            2) 每条卖点必须包含 point 与 citation。
-            3) citation 只能是以下编号之一: {", ".join(sorted(refs, key=self._ref_sort_key))}。
-            4) 输出 2-{max(2, max_points)} 条，中文简洁表达。
-
-            仅输出 JSON 数组:
-            [{{"point":"控油持妆","citation":"image_1"}}]
+            \u7ea6\u675f\uff1a
+            1) \u53ea\u80fd\u4f9d\u636e\u56fe\u7247\u91cc\u76f4\u63a5\u53ef\u89c1\u7684\u6587\u5b57\u3001\u5305\u88c5\u3001\u989c\u8272\u3001\u7ed3\u6784\u3001\u89c4\u683c\u3001\u793c\u76d2\u4e0e\u8d60\u54c1\u4fe1\u606f\u3002
+            2) \u5ffd\u7565\u5e73\u53f0\u5bfc\u822a\u3001\u5e97\u94fa\u5165\u53e3\u3001\u5ba2\u670d\u7269\u6d41\u552e\u540e\u3001\u4f1a\u5458\u6743\u76ca\u3001\u7eaf\u4fc3\u9500\u6a2a\u5e45\u3001\u4e0e\u5546\u54c1\u65e0\u5173\u7684\u9875\u9762\u88c5\u9970\u3002
+            3) \u8bc1\u636e\u4e0d\u8db3\u65f6\u8fd4\u56de []\uff0c\u4e0d\u8981\u731c\u6d4b\u3002
+            4) \u6bcf\u6761\u5356\u70b9\u5fc5\u987b\u5305\u542b point \u4e0e citation\u3002
+            5) citation \u53ea\u80fd\u662f\u4ee5\u4e0b\u7f16\u53f7\u4e4b\u4e00: {", ".join(sorted(refs, key=self._ref_sort_key))}.
+            6) \u4e0d\u8981\u8f93\u51fa\u8fd1\u4e49\u91cd\u590d\u70b9\uff1b\u53ea\u63d0\u70bc\u6700\u6709\u4fe1\u606f\u91cf\u7684 1-{max(2, max_points)} points.
+            \u4ec5\u8f93\u51fa JSON \u6570\u7ec4\uff1a
+            [{{"point": "Gift box with limited packaging", "citation": "image_1"}}]
             """
         ).strip()
         raw_text = gemini_generate_json_text(
@@ -539,6 +958,7 @@ class SellingPointExtractor:
             proxy_url=self.gemini_proxy_url,
             timeout_sec=self.gemini_timeout_sec,
             raise_on_transient=self.gemini_raise_on_transient,
+            debug_meta=debug_meta,
         )
         if not raw_text:
             return []
@@ -557,24 +977,50 @@ class SellingPointExtractor:
         if not candidates:
             return []
 
-        primary = self._generate_image_points_with_gemini(
-            item_context=item_context, candidates=candidates[:6], max_points=8
-        )
-        if primary:
-            return primary
-
-        without_first = [row for row in candidates if row[0] != "image_1"] or candidates
-        retry = self._generate_image_points_with_gemini(
-            item_context=item_context, candidates=without_first[:4], max_points=6
-        )
-        if retry:
-            return retry
-
+        batches = self._split_image_candidate_batches(candidates)
         merged: list[dict[str, str]] = []
         seen: set[str] = set()
-        for row in without_first[:4]:
+        valid_refs = {
+            b.get("source_ref", "") for b in detail_blocks if b.get("source_ref")
+        }
+        base_meta = {
+            "stage": "llm_extract_images",
+            "item_id": str(item_context.get("item_id", "")),
+            "workbook_id": str(item_context.get("workbook_id", "")),
+            "task_id": str(item_context.get("task_id", "")),
+            "platform": str(item_context.get("platform", "")),
+        }
+        for batch_index, batch in enumerate(batches, start=1):
+            batch_points = self._generate_image_points_with_gemini(
+                item_context=item_context,
+                candidates=batch,
+                max_points=min(8, max(3, len(batch) + 1)),
+                debug_meta={
+                    **base_meta,
+                    "batch_index": batch_index,
+                    "batch_count": len(batches),
+                    "candidate_refs": [ref for ref, _, _ in batch],
+                },
+            )
+            for point in batch_points:
+                key = f"{point.get('point', '')}|{point.get('citation', '')}"
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(point)
+        if merged:
+            return self._validate(merged, valid_refs)
+
+        for row in candidates:
             single = self._generate_image_points_with_gemini(
-                item_context=item_context, candidates=[row], max_points=2
+                item_context=item_context,
+                candidates=[row],
+                max_points=2,
+                debug_meta={
+                    **base_meta,
+                    "stage": "llm_extract_images_single_fallback",
+                    "candidate_refs": [row[0]],
+                },
             )
             for point in single:
                 key = f"{point.get('point', '')}|{point.get('citation', '')}"
@@ -582,23 +1028,21 @@ class SellingPointExtractor:
                     continue
                 seen.add(key)
                 merged.append(point)
-                if len(merged) >= 6:
+                if len(merged) >= 12:
                     break
-            if len(merged) >= 6:
+            if len(merged) >= 12:
                 break
         if merged:
-            valid_refs = {
-                b.get("source_ref", "") for b in detail_blocks if b.get("source_ref")
-            }
             return self._validate(merged, valid_refs)
         return []
 
     @staticmethod
     def _validate(
-        points: list[dict[str, Any]], valid_refs: set[str]
+        points: list[dict[str, Any]], valid_refs: set[str], limit: int = 12
     ) -> list[dict[str, str]]:
         clean_rows: list[dict[str, str]] = []
         seen: set[str] = set()
+        citation_counts: dict[str, int] = {}
         for point_obj in points:
             if not isinstance(point_obj, dict):
                 continue
@@ -610,12 +1054,15 @@ class SellingPointExtractor:
                 continue
             if citation not in valid_refs:
                 continue
+            if citation_counts.get(citation, 0) >= 3:
+                continue
             key = f"{point}|{citation}"
             if key in seen:
                 continue
             seen.add(key)
+            citation_counts[citation] = citation_counts.get(citation, 0) + 1
             clean_rows.append({"point": point, "citation": citation})
-            if len(clean_rows) >= 8:
+            if len(clean_rows) >= max(1, int(limit)):
                 break
         return clean_rows
 
@@ -633,6 +1080,13 @@ class SellingPointExtractor:
             proxy_url=self.gemini_proxy_url,
             timeout_sec=self.gemini_timeout_sec,
             raise_on_transient=self.gemini_raise_on_transient,
+            debug_meta={
+                "stage": "llm_extract_text",
+                "item_id": str(item_context.get("item_id", "")),
+                "workbook_id": str(item_context.get("workbook_id", "")),
+                "task_id": str(item_context.get("task_id", "")),
+                "platform": str(item_context.get("platform", "")),
+            },
         )
         if not raw:
             return []
@@ -909,7 +1363,13 @@ class Analyzer:
             )
         return "\n\n".join(sections)
 
-    def _generate_json_text(self, prompt: str, model: str, raise_on_transient: bool) -> str:
+    def _generate_json_text(
+        self,
+        prompt: str,
+        model: str,
+        raise_on_transient: bool,
+        debug_meta: dict[str, Any] | None = None,
+    ) -> str:
         return gemini_generate_json_text(
             api_key=self.gemini_api_key,
             model=model,
@@ -917,9 +1377,12 @@ class Analyzer:
             proxy_url=self.gemini_proxy_url,
             timeout_sec=self.gemini_timeout_sec,
             raise_on_transient=raise_on_transient,
+            debug_meta=debug_meta,
         )
 
-    def _generate_json(self, prompt: str) -> Any:
+    def _generate_json(
+        self, prompt: str, debug_meta: dict[str, Any] | None = None
+    ) -> Any:
         if not self.gemini_api_key:
             return {}
 
@@ -931,6 +1394,7 @@ class Analyzer:
                     prompt=prompt,
                     model=self.gemini_pro_model,
                     raise_on_transient=True,
+                    debug_meta=debug_meta,
                 )
             except Exception as exc:
                 last_error = exc
@@ -960,6 +1424,11 @@ class Analyzer:
                     prompt=prompt,
                     model=flash_model,
                     raise_on_transient=False,
+                    debug_meta={
+                        **(debug_meta or {}),
+                        "fallback_model": flash_model,
+                        "fallback_from": self.gemini_pro_model,
+                    },
                 )
                 if flash_text:
                     LOG.warning(
@@ -979,26 +1448,84 @@ class Analyzer:
             raise TransientGeminiError(str(last_error)) from last_error
         return {}
 
-    def analyze_item(
-        self,
-        item_id: str,
-        item_points: list[dict[str, Any]],
-        workbook_points_map: dict[str, list[dict[str, Any]]],
-        item_title: str = "",
-    ) -> dict[str, Any]:
+    @staticmethod
+    def _single_sample_points_from_row(row: dict[str, str], limit: int = 4) -> list[str]:
+        values = [clean_text(p, max_len=80) for p in str(row.get("selling_points_text", "")).split("|") if clean_text(p, max_len=80)]
+        deduped: list[str] = []
+        for value in values:
+            if value not in deduped:
+                deduped.append(value)
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    @staticmethod
+    def _single_sample_tags(row: dict[str, str], limit: int = 4) -> list[str]:
+        tags = [clean_text(p, max_len=24) for p in str(row.get("market_tags", "")).split("|") if clean_text(p, max_len=24)]
+        deduped: list[str] = []
+        for tag in tags:
+            if tag not in deduped:
+                deduped.append(tag)
+            if len(deduped) >= limit:
+                break
+        return deduped or Analyzer._single_sample_points_from_row(row, limit=limit)
+
+    @staticmethod
+    def _single_sample_item_analysis(item_id: str, item_title: str, item_platform: str, item_points: list[dict[str, Any]]) -> dict[str, Any]:
+        point_rows = [clean_text(str(p.get("point", "")), max_len=80) for p in item_points if clean_text(str(p.get("point", "")), max_len=80)]
+        citations = [clean_text(str(p.get("citation", "")), max_len=80) for p in item_points if clean_text(str(p.get("citation", "")), max_len=80)]
+        point_rows = list(dict.fromkeys(point_rows))[:4]
+        item_name = clean_text(item_title, max_len=64) or clean_text(item_id, max_len=48) or "This item"
+        if not point_rows:
+            return {"competitor_analysis_text": "", "market_tags": []}
+        lines = [f"\u5546\u54c1\uff1a{item_name}", "\u8bf4\u660e\uff1a\u5f53\u524d\u4ec5\u6709\u5355\u5546\u54c1\u6837\u672c\uff0c\u4ee5\u4e0b\u4e3a\u5546\u54c1\u81ea\u8eab\u5356\u70b9\u89c2\u5bdf\uff0c\u4e0d\u6784\u6210\u7ade\u54c1\u5bf9\u6bd4\u7ed3\u8bba\u3002", "\u6838\u5fc3\u5356\u70b9\uff1a" + ", ".join(point_rows[:3])]
+        if len(point_rows) >= 4:
+            lines.append("\u8865\u5145\u89c2\u5bdf\uff1a" + point_rows[3])
+        if citations:
+            lines.append(SellingPointExtractor._detail_citation_label(item_platform) + ", ".join(list(dict.fromkeys(citations))[:6]))
+        return {"competitor_analysis_text": "\n".join(lines), "market_tags": point_rows[:4]}
+
+    @staticmethod
+    def _single_sample_batch_summary(row: dict[str, str]) -> dict[str, Any]:
+        points = Analyzer._single_sample_points_from_row(row, limit=4)
+        if not points:
+            return {"batch_competitor_summary_text": "", "batch_tags": []}
+        item_name = clean_text(row.get("title", ""), max_len=64) or clean_text(row.get("item_id", ""), max_len=48) or "该商品"
+        text = "\n\n".join([
+            "\u6837\u672c\u8303\u56f4\uff1a\u5f53\u524d\u4ec5\u7eb3\u5165 1 \u6b3e\u5546\u54c1\uff0c\u4ee5\u4e0b\u5185\u5bb9\u4ec5\u63cf\u8ff0\u8be5\u6837\u672c\u81ea\u8eab\u8868\u8fbe\uff0c\u4e0d\u6784\u6210\u6279\u91cf\u7ade\u54c1\u7efc\u8ff0\u3002",
+            f"\u5546\u54c1\uff1a{item_name}",
+            "\u5355\u6837\u672c\u6279\u91cf\u6982\u89c8\uff1a\n" + "\n".join([f"{idx}. {point}" for idx, point in enumerate(points, start=1)]),
+        ])
+        return {"batch_competitor_summary_text": text, "batch_tags": Analyzer._single_sample_tags(row)}
+
+    @staticmethod
+    def _single_sample_market_summary(row: dict[str, str]) -> dict[str, Any]:
+        points = Analyzer._single_sample_points_from_row(row, limit=4)
+        item_name = clean_text(row.get("title", ""), max_len=64) or clean_text(row.get("item_id", ""), max_len=48) or "该商品"
+        price_text = clean_text(row.get("price_min", "") or row.get("price_max", ""), max_len=32)
+        common = f"\u5f53\u524d\u4ec5\u57fa\u4e8e 1 \u6b3e\u6837\u672c\uff0c\u65e0\u6cd5\u53ef\u9760\u5224\u65ad\u5e02\u573a\u5171\u6027\u3002\u53ef\u786e\u8ba4 {item_name} \u7684\u4e3b\u8981\u5356\u70b9\u96c6\u4e2d\u5728\uff1a{'\u3001'.join(points[:3]) or '\u8bc1\u636e\u4e0d\u8db3'}\u3002"
+        opportunities = f"\u5f53\u524d\u6837\u672c\u4e2d\u53ef\u76f4\u63a5\u89c2\u5bdf\u5230\u7684\u7279\u8272\u8868\u8fbe\u4e3a\uff1a{'\u3001'.join(points[:2]) or '\u6682\u65e0'}"
+        risks = "\u5f53\u524d\u4ec5\u6709 1 \u6b3e\u6837\u672c\uff0c\u65e0\u6cd5\u53ef\u9760\u5224\u65ad\u7ade\u4e89\u5f3a\u5ea6\u3001\u540c\u8d28\u5316\u7a0b\u5ea6\u6216\u5e02\u573a\u673a\u4f1a\u5206\u5e03\u3002"
+        if price_text:
+            common += f"\u89c2\u5bdf\u5230\u7684\u4ef7\u683c\u4e3a\uff1a{price_text}\u3002"
+        return {"summary_text": f"\u5e02\u573a\u5171\u6027\uff1a{common}\n\u5dee\u5f02\u5316\u5206\u5e03\uff1a{opportunities}\n\u7ade\u4e89\u72b6\u6001\uff1a{risks}", "common_points": [common], "opportunities": [opportunities], "risks": [risks], "market_tags": Analyzer._single_sample_tags(row), "updated_at": now_iso(), "sample_size": 1, "point_count": len(points)}
+
+    @staticmethod
+    def _single_sample_final_conclusion(row: dict[str, str]) -> str:
+        points = Analyzer._single_sample_points_from_row(row, limit=4)
+        item_name = clean_text(row.get("title", ""), max_len=64) or clean_text(row.get("item_id", ""), max_len=48) or "该商品"
+        if not points:
+            return "\u5f53\u524d\u4ec5\u6709 1 \u6b3e\u6837\u672c\uff0c\u4e14\u8bc1\u636e\u4e0d\u8db3\uff0c\u4e0d\u5e94\u5916\u63a8\u4e3a\u5e02\u573a\u7ed3\u8bba\u3002"
+        lead = f"\u5f53\u524d\u4ec5\u6709 1 \u6b3e\u6837\u672c\uff0c\u4e0d\u5e94\u5916\u63a8\u4e3a\u5e02\u573a\u7ed3\u8bba\u3002\u53ef\u786e\u8ba4 {item_name} \u7684\u4e3b\u8981\u5356\u70b9\u4e3a\uff1a{'\u3001'.join(points[:3])}\u3002"
+        if len(points) > 3:
+            lead += f"\u8865\u5145\u8868\u8fbe\u5305\u62ec\uff1a{points[3]}\u3002"
+        return lead
+
+    def analyze_item(self, item_id: str, item_points: list[dict[str, Any]], workbook_points_map: dict[str, list[dict[str, Any]]], item_title: str = "", item_platform: str = "", workbook_id: str = "", task_id: str = "") -> dict[str, Any]:
         if not self.gemini_api_key:
             return {"competitor_analysis_text": "", "market_tags": []}
-
-        current_points = [
-            clean_text(str(p.get("point", "")), max_len=80)
-            for p in item_points
-            if str(p.get("point", "")).strip()
-        ]
-        citations = [
-            clean_text(str(p.get("citation", "")), max_len=80)
-            for p in item_points
-            if str(p.get("citation", "")).strip()
-        ]
+        current_points = [clean_text(str(p.get("point", "")), max_len=80) for p in item_points if str(p.get("point", "")).strip()]
+        citations = [clean_text(str(p.get("citation", "")), max_len=80) for p in item_points if str(p.get("citation", "")).strip()]
         peer_points: list[str] = []
         for peer_item_id, points in workbook_points_map.items():
             if peer_item_id == item_id:
@@ -1007,156 +1534,77 @@ class Analyzer:
                 value = clean_text(str(point_obj.get("point", "")), max_len=80)
                 if value:
                     peer_points.append(value)
-
-        prompt = textwrap.dedent(
-            f"""
-            你是市场咨询公司资深竞品顾问。请针对单一商品输出“对业务有指导意义”的竞品洞察。
-            输入数据全部来自卖点与引用，不得编造事实。
-
-            商品ID: {item_id}
-            当前商品卖点: {json.dumps(current_points[:12], ensure_ascii=False)}
-            同类其他商品卖点: {json.dumps(peer_points[:120], ensure_ascii=False)}
-            当前商品引用: {json.dumps(citations[:12], ensure_ascii=False)}
-
-            分析要求:
-            1) core_points: 当前商品最核心、最有价值感知的卖点（最多3条）。
-            2) differentiated_points: 相比同类更有差异化的表达（最多3条）。
-            3) homogenized_points: 与同类高度重叠、易被替代的表达（最多3条）。
-            4) citation_notes: 对应引用编号与简要说明，格式建议“text_3: xxx”（最多6条）。
-            5) market_tags: 可用于看板过滤的关键词标签（2-6条，短词）。
-
-            仅输出 JSON:
-            {{
-              "core_points": ["..."],
-              "differentiated_points": ["..."],
-              "homogenized_points": ["..."],
-              "citation_notes": ["..."],
-              "market_tags": ["..."]
-            }}
-            """
-        ).strip()
-        payload = self._generate_json(prompt)
+        if not peer_points:
+            return self._single_sample_item_analysis(item_id, item_title, item_platform, item_points)
+        prompt = textwrap.dedent(f"""
+            \u4f60\u662f\u5e02\u573a\u54a8\u8be2\u516c\u53f8\u8d44\u6df1\u7ade\u54c1\u987e\u95ee\u3002\u8bf7\u9488\u5bf9\u5355\u4e00\u5546\u54c1\u8f93\u51fa\u6709\u8bc1\u636e\u7ea6\u675f\u7684\u7ade\u54c1\u89c2\u5bdf\u3002
+            \u5546\u54c1ID: {item_id}
+            \u5f53\u524d\u5546\u54c1\u5356\u70b9\uff1a{json.dumps(current_points[:12], ensure_ascii=False)}
+            \u540c\u7c7b\u5176\u4ed6\u5546\u54c1\u5356\u70b9\uff1a{json.dumps(peer_points[:120], ensure_ascii=False)}
+            \u5f53\u524d\u5f15\u7528\uff1a{json.dumps(citations[:12], ensure_ascii=False)}
+            \u4ec5\u8f93\u51fa JSON\uff0c\u5305\u542b core_points\u3001differentiated_points\u3001homogenized_points\u3001citation_notes\u3001market_tags\u3002
+        """).strip()
+        payload = self._generate_json(prompt, debug_meta={"stage": "llm_analyze_item", "item_id": item_id, "workbook_id": workbook_id, "task_id": task_id, "platform": item_platform})
         if not isinstance(payload, dict):
             return {"competitor_analysis_text": "", "market_tags": []}
-
         core = self._to_string_list(payload.get("core_points"))[:3]
         diff = self._to_string_list(payload.get("differentiated_points"))[:3]
         homo = self._to_string_list(payload.get("homogenized_points"))[:3]
         notes = self._to_string_list(payload.get("citation_notes"), max_len=80)[:6]
         tags = self._to_string_list(payload.get("market_tags"), max_len=40)[:6]
         if current_points:
-
             def _aligned(point_text: str) -> bool:
                 value = clean_text(point_text, max_len=80)
-                return any(
-                    value in current or current in value
-                    for current in current_points
-                    if current
-                )
-
+                return any(value in current or current in value for current in current_points if current)
             core = [point for point in core if _aligned(point)]
             diff = [point for point in diff if _aligned(point)]
             homo = [point for point in homo if _aligned(point)]
             if not core:
                 core = current_points[:3]
             if not diff:
-                diff = [point for point in current_points if point not in peer_points][
-                    :3
-                ]
+                diff = [point for point in current_points if point not in peer_points][:3]
             if not homo:
                 homo = [point for point in current_points if point in peer_points][:3]
         if not core and not diff and not homo:
             return {"competitor_analysis_text": "", "market_tags": []}
-        item_name = (
-            clean_text(item_title, max_len=64)
-            or clean_text(item_id, max_len=48)
-            or "该商品"
-        )
-        conclusion = (
-            f"{item_name}在样本中有一定区分度，重点体现在{'、'.join(diff)}。"
-            if diff
-            else f"{item_name}以主流卖点为主，差异化空间有限。"
-        )
-        lines: list[str] = [f"商品：{item_name}"]
+        item_name = clean_text(item_title, max_len=64) or clean_text(item_id, max_len=48) or "This item"
+        conclusion = f"{item_name} \u5728\u6837\u672c\u4e2d\u5177\u5907\u4e00\u5b9a\u533a\u5206\u5ea6\uff0c\u91cd\u70b9\u4f53\u73b0\u5728\uff1a{', '.join(diff)}." if diff else f"{item_name} \u4ee5\u4e3b\u6d41\u5356\u70b9\u4e3a\u4e3b\uff0c\u5dee\u5f02\u5316\u7a7a\u95f4\u6709\u9650\u3002"
+        lines = [f"\u5546\u54c1\uff1a{item_name}"]
         if core:
-            lines.append("核心卖点：" + "、".join(core))
+            lines.append("\u6838\u5fc3\u5356\u70b9\uff1a" + ", ".join(core))
         if diff:
-            lines.append("差异化卖点：" + "、".join(diff))
+            lines.append("\u5dee\u5f02\u5316\u5356\u70b9\uff1a" + ", ".join(diff))
         if homo:
-            lines.append("同质化卖点：" + "、".join(homo))
-        lines.append(f"结论：{conclusion}")
+            lines.append("\u540c\u8d28\u5316\u5356\u70b9\uff1a" + ", ".join(homo))
+        lines.append("\u7ed3\u8bba\uff1a" + conclusion)
         refs = notes or citations[:6]
         if refs:
-            lines.append("图文详情页引用：" + "、".join(refs))
+            lines.append(SellingPointExtractor._detail_citation_label(item_platform) + ", ".join(refs))
         text = "\n".join(lines)
         if not tags:
             tags = (core[:2] + diff[:2])[:6]
         return {"competitor_analysis_text": text, "market_tags": tags}
 
-    def generate_batch_competitor_summary(
-        self,
-        rows: list[dict[str, str]],
-        workbook_points_map: dict[str, list[dict[str, Any]]],
-    ) -> dict[str, Any]:
+    def generate_batch_competitor_summary(self, rows: list[dict[str, str]], workbook_points_map: dict[str, list[dict[str, Any]]], *, workbook_id: str = "", task_id: str = "") -> dict[str, Any]:
         if not self.gemini_api_key:
             return {"batch_competitor_summary_text": "", "batch_tags": []}
-
-        payload_rows: list[dict[str, Any]] = []
+        if len(rows) <= 1:
+            return self._single_sample_batch_summary(rows[0]) if rows else {"batch_competitor_summary_text": "", "batch_tags": []}
+        payload_rows = []
         for row in rows[:120]:
             item_id = row.get("item_id", "")
             points = workbook_points_map.get(item_id, [])
-            payload_rows.append(
-                {
-                    "item_id": item_id,
-                    "title": clean_text(row.get("title", ""), max_len=120),
-                    "brand": clean_text(row.get("brand", ""), max_len=80),
-                    "selling_points": [
-                        {
-                            "point": clean_text(
-                                str(point.get("point", "")), max_len=80
-                            ),
-                            "citation": clean_text(
-                                str(point.get("citation", "")), max_len=80
-                            ),
-                        }
-                        for point in points[:8]
-                        if str(point.get("point", "")).strip()
-                    ],
-                }
-            )
-
-        prompt = textwrap.dedent(
-            f"""
-            你是市场咨询公司项目经理，请基于样本输出“批量竞品综述”。
-            所有观点必须可追溯到样本卖点和引用，不得虚构。
-            样本:
-            {json.dumps(payload_rows, ensure_ascii=False)}
-
-            分析要求:
-            1) core_points: 赛道高频核心诉求（最多5条）。
-            2) differentiated_points: 能形成区隔的表达（最多5条，可带商品标题）。
-            3) homogenized_points: 同质化最严重的表达（最多5条）。
-            4) citation_notes: 关键证据说明，优先引用编号（最多8条）。
-            5) batch_tags: 适合聚合分析的标签词（最多10条）。
-
-            仅输出 JSON:
-            {{
-              "core_points": ["..."],
-              "differentiated_points": ["..."],
-              "homogenized_points": ["..."],
-              "citation_notes": ["..."],
-              "batch_tags": ["..."]
-            }}
-            """
-        ).strip()
-        payload = self._generate_json(prompt)
+            payload_rows.append({"item_id": item_id, "title": clean_text(row.get("title", ""), max_len=120), "brand": clean_text(row.get("brand", ""), max_len=80), "selling_points": [{"point": clean_text(str(point.get("point", "")), max_len=80), "citation": clean_text(str(point.get("citation", "")), max_len=80)} for point in points[:8] if str(point.get("point", "")).strip()]})
+        prompt = textwrap.dedent(f"""
+            \u4f60\u662f\u5e02\u573a\u54a8\u8be2\u516c\u53f8\u9879\u76ee\u7ecf\u7406\uff0c\u8bf7\u57fa\u4e8e\u6837\u672c\u8f93\u51fa\u6279\u91cf\u7ade\u54c1\u7efc\u8ff0\u3002
+            \u6837\u672c\uff1a{json.dumps(payload_rows, ensure_ascii=False)}
+            Output JSON only with core_points, differentiated_points, homogenized_points, citation_notes, batch_tags.
+        """).strip()
+        payload = self._generate_json(prompt, debug_meta={"stage": "llm_analyze_batch_summary", "workbook_id": workbook_id, "task_id": task_id})
         if not isinstance(payload, dict):
             return {"batch_competitor_summary_text": "", "batch_tags": []}
-
         core = self._to_string_list(payload.get("core_points"), max_len=120)[:5]
-        diff = self._to_string_list(payload.get("differentiated_points"), max_len=180)[
-            :5
-        ]
+        diff = self._to_string_list(payload.get("differentiated_points"), max_len=180)[:5]
         homo = self._to_string_list(payload.get("homogenized_points"), max_len=120)[:5]
         notes = self._to_string_list(payload.get("citation_notes"), max_len=180)[:8]
         tags = self._to_string_list(payload.get("batch_tags"), max_len=30)[:10]
@@ -1172,11 +1620,10 @@ class Analyzer:
                         break
                 if len(notes) >= 8:
                     break
-
-        prices: list[float] = []
-        tiers = {"入门": 0, "中端": 0, "高端": 0, "未知": 0}
+        prices = []
+        tiers = {"??": 0, "??": 0, "??": 0, "??": 0}
         for row in rows:
-            price: float | None = None
+            price = None
             for key in ("price_min", "price_max"):
                 raw = (row.get(key, "") or "").strip()
                 if not raw:
@@ -1190,7 +1637,7 @@ class Analyzer:
                 prices.append(price)
         q1, q2 = Analyzer._price_quantiles(prices)
         for row in rows:
-            price: float | None = None
+            price = None
             for key in ("price_min", "price_max"):
                 raw = (row.get(key, "") or "").strip()
                 if not raw:
@@ -1202,56 +1649,23 @@ class Analyzer:
                     continue
             tier = Analyzer._price_tier(price, q1, q2)
             tiers[tier] = tiers.get(tier, 0) + 1
-        tier_text = (
-            f"入门{tiers.get('入门',0)} | 中端{tiers.get('中端',0)} | 高端{tiers.get('高端',0)}"
-            if prices
-            else f"价格信息缺失(未知{tiers.get('未知', 0)})"
-        )
-        context_line = Analyzer._build_brand_context_line(
-            rows=rows,
-            tier_text=tier_text,
-            theme_text="",
-        )
-
-        summary_text = Analyzer._format_batch_summary_text(
-            sample_size=len(rows),
-            core_points=core,
-            differentiated_points=diff,
-            homogenized_points=homo,
-            citation_notes=list(dict.fromkeys(notes))[:8],
-            context_line=context_line,
-        )
+        tier_text = f"Entry {tiers.get('??',0)} | Mid {tiers.get('??',0)} | High {tiers.get('??',0)}" if prices else f"No price info (unknown {tiers.get('??',0)})"
+        context_line = Analyzer._build_brand_context_line(rows=rows, tier_text=tier_text, theme_text="")
+        summary_text = Analyzer._format_batch_summary_text(sample_size=len(rows), core_points=core, differentiated_points=diff, homogenized_points=homo, citation_notes=list(dict.fromkeys(notes))[:8], context_line=context_line)
         if not tags:
             tags = (core[:3] + homo[:2])[:10]
-        return {
-            "batch_competitor_summary_text": summary_text,
-            "batch_tags": tags,
-        }
+        return {"batch_competitor_summary_text": summary_text, "batch_tags": tags}
 
     @staticmethod
-    def build_row_market_mapping(
-        row: dict[str, str],
-        point_freq: dict[str, int],
-        q1: float,
-        q2: float,
-    ) -> dict[str, str]:
-        points = [
-            clean_text(p, max_len=80)
-            for p in str(row.get("selling_points_text", "")).split("|")
-            if clean_text(p, max_len=80)
-        ]
+    def build_row_market_mapping(row: dict[str, str], point_freq: dict[str, int], q1: float, q2: float) -> dict[str, str]:
+        points = [clean_text(p, max_len=80) for p in str(row.get("selling_points_text", "")).split("|") if clean_text(p, max_len=80)]
         if not points:
             return {"batch": "", "market": "", "final": ""}
-        item_name = (
-            clean_text(row.get("title", ""), max_len=48)
-            or clean_text(row.get("item_id", ""), max_len=48)
-            or "该商品"
-        )
+        item_name = clean_text(row.get("title", ""), max_len=48) or clean_text(row.get("item_id", ""), max_len=48) or "This item"
         core = points[:3]
         unique = [p for p in points if point_freq.get(p, 0) == 1][:2]
         homo = [p for p in points if point_freq.get(p, 0) >= 2][:2]
-
-        price: float | None = None
+        price = None
         for field in ("price_min", "price_max"):
             raw = (row.get(field, "") or "").strip()
             if not raw:
@@ -1262,97 +1676,49 @@ class Analyzer:
             except ValueError:
                 continue
         tier = Analyzer._price_tier(price, q1, q2)
-        theme = Analyzer._theme_of_point(points[0]) if points else "其他表达"
-        core_text = "、".join(core)
-        diff_text = "、".join(unique)
-        same_text = "、".join(homo)
-
+        theme = Analyzer._theme_of_point(points[0]) if points else "other"
+        core_text = ", ".join(core)
+        diff_text = ", ".join(unique)
+        same_text = ", ".join(homo)
         overlap_ratio = len(homo) / len(points) if points else 0.0
-        if overlap_ratio >= 0.66:
-            overlap_level = "较高"
-        elif overlap_ratio >= 0.34:
-            overlap_level = "中等"
-        else:
-            overlap_level = "较低"
-
-        price_text = f"{price:.2f}元" if price is not None else "价格信息缺失"
-        batch_parts: list[str] = [f"{item_name}核心卖点为{core_text}"]
+        overlap_level = "high" if overlap_ratio >= 0.66 else "medium" if overlap_ratio >= 0.34 else "low"
+        price_text = f"{price:.2f}" if price is not None else "n/a"
+        batch_parts = [f"{item_name} core points: {core_text}"]
         if diff_text:
-            batch_parts.append(f"可区分卖点是{diff_text}")
+            batch_parts.append(f"differentiated: {diff_text}")
         if same_text:
-            batch_parts.append(f"与同类重合点有{same_text}")
-        batch_text = "；".join(batch_parts) + "。"
-
-        market_parts: list[str] = [
-            f"{item_name}位于{tier}价格档（{price_text}）",
-            f"主打{theme}方向",
-            f"同质化程度{overlap_level}",
-        ]
+            batch_parts.append(f"shared: {same_text}")
+        batch_text = "; ".join(batch_parts)
+        market_parts = [f"{item_name} price tier: {tier} ({price_text})", f"theme: {theme}", f"overlap: {overlap_level}"]
         if diff_text:
-            market_parts.append(f"可识别区分点为{diff_text}")
-        market_text = "；".join(market_parts) + "。"
-
-        final_text = (
-            f"{item_name}主要卖点：{core_text}；"
-            f"差异化卖点：{diff_text or '不明显'}。"
-        )
+            market_parts.append(f"distinctive points: {diff_text}")
+        market_text = "; ".join(market_parts)
+        final_text = f"{item_name} main points: {core_text}; differentiated points: {diff_text or 'not obvious'}."
         return {"batch": batch_text, "market": market_text, "final": final_text}
 
-    def generate_final_conclusion(
-        self,
-        rows: list[dict[str, str]],
-        batch_competitor_summary_text: str,
-        market_summary_text: str,
-    ) -> str:
+    def generate_final_conclusion(self, rows: list[dict[str, str]], batch_competitor_summary_text: str, market_summary_text: str, *, workbook_id: str = "", task_id: str = "") -> str:
         if not self.gemini_api_key:
             return ""
-
-        sample_rows: list[dict[str, Any]] = []
+        if len(rows) <= 1:
+            return self._single_sample_final_conclusion(rows[0]) if rows else ""
+        sample_rows = []
         for row in rows[:80]:
-            sample_rows.append(
-                {
-                    "item_id": row.get("item_id", ""),
-                    "title": clean_text(row.get("title", ""), max_len=120),
-                    "brand": clean_text(row.get("brand", ""), max_len=80),
-                    "price_min": row.get("price_min", ""),
-                    "price_max": row.get("price_max", ""),
-                    "selling_points_text": clean_text(
-                        row.get("selling_points_text", ""), max_len=300
-                    ),
-                }
-            )
-
-        prompt = textwrap.dedent(
-            f"""
-            你是市场咨询公司总监，请基于输入形成“最终市场结论”。
-            输出应清晰可读，禁止编造，禁止输出建议动作。
-            批量竞品总结:
-            {batch_competitor_summary_text}
-            市场总结:
-            {market_summary_text}
-            样本:
-            {json.dumps(sample_rows, ensure_ascii=False)}
-
-            输出 JSON:
-            {{
-              "final_conclusion": "3-6句，包含赛道判断、竞争格局、差异化空间"
-            }}
-            """
-        ).strip()
-        payload = self._generate_json(prompt)
+            sample_rows.append({"item_id": row.get("item_id", ""), "title": clean_text(row.get("title", ""), max_len=120), "brand": clean_text(row.get("brand", ""), max_len=80), "price_min": row.get("price_min", ""), "price_max": row.get("price_max", ""), "selling_points_text": clean_text(row.get("selling_points_text", ""), max_len=300)})
+        prompt = textwrap.dedent(f"""
+            \u4f60\u662f\u5e02\u573a\u54a8\u8be2\u516c\u53f8\u603b\u76d1\uff0c\u8bf7\u57fa\u4e8e\u8f93\u5165\u5f62\u6210\u6700\u7ec8\u5e02\u573a\u7ed3\u8bba\u3002
+            \u6279\u91cf\u7ade\u54c1\u603b\u7ed3\uff1a{batch_competitor_summary_text}
+            \u5e02\u573a\u603b\u7ed3\uff1a{market_summary_text}
+            \u6837\u672c\uff1a{json.dumps(sample_rows, ensure_ascii=False)}
+            Output JSON only: {{"final_conclusion": "3-6 sentences"}}
+        """).strip()
+        payload = self._generate_json(prompt, debug_meta={"stage": "llm_analyze_final_conclusion", "workbook_id": workbook_id, "task_id": task_id})
         if not isinstance(payload, dict):
             return ""
-
-        final_conclusion = clean_text(
-            str(payload.get("final_conclusion", "")), max_len=1500
-        )
+        final_conclusion = clean_text(str(payload.get("final_conclusion", "")), max_len=1500)
         if not final_conclusion:
             return ""
-        final_conclusion = final_conclusion.replace("。 按产品结论", "。\n\n按产品结论")
-        final_conclusion = final_conclusion.replace("。 商品：", "。\n\n商品：")
-
-        point_freq: dict[str, int] = {}
-        prices: list[float] = []
+        point_freq = {}
+        prices = []
         for row in rows:
             for point in str(row.get("selling_points_text", "")).split("|"):
                 text = clean_text(point, max_len=80)
@@ -1368,113 +1734,38 @@ class Analyzer:
                 except ValueError:
                     continue
         q1, q2 = Analyzer._price_quantiles(prices)
-        sections: list[str] = []
+        sections = []
         for row in rows:
             mapping = Analyzer.build_row_market_mapping(row, point_freq, q1, q2)
             if mapping["final"]:
                 sections.append(mapping["final"])
         if not sections:
             return final_conclusion
-        return "\n".join([final_conclusion, "", "按产品结论：", "\n\n".join(sections)])
+        return "\n".join([final_conclusion, "", "\u6309\u4ea7\u54c1\u7ed3\u8bba\uff1a", "\n\n".join(sections)])
 
-    def generate_market_summary(
-        self,
-        rows: list[dict[str, str]],
-        workbook_points_map: dict[str, list[dict[str, Any]]],
-    ) -> dict[str, Any]:
+    def generate_market_summary(self, rows: list[dict[str, str]], workbook_points_map: dict[str, list[dict[str, Any]]], *, workbook_id: str = "", task_id: str = "") -> dict[str, Any]:
         if not self.gemini_api_key:
-            return {
-                "summary_text": "",
-                "common_points": [],
-                "opportunities": [],
-                "risks": [],
-                "market_tags": [],
-                "updated_at": now_iso(),
-                "sample_size": len(rows),
-                "point_count": 0,
-            }
-
-        payload_rows: list[dict[str, Any]] = []
+            return {"summary_text": "", "common_points": [], "opportunities": [], "risks": [], "market_tags": [], "updated_at": now_iso(), "sample_size": len(rows), "point_count": 0}
+        if len(rows) <= 1:
+            return self._single_sample_market_summary(rows[0]) if rows else {"summary_text": "", "common_points": [], "opportunities": [], "risks": [], "market_tags": [], "updated_at": now_iso(), "sample_size": 0, "point_count": 0}
+        payload_rows = []
         for row in rows[:120]:
             item_id = row.get("item_id", "")
             points = workbook_points_map.get(item_id, [])
-            payload_rows.append(
-                {
-                    "item_id": item_id,
-                    "title": row.get("title", ""),
-                    "brand": row.get("brand", ""),
-                    "shop_name": row.get("shop_name", ""),
-                    "selling_points": [
-                        {
-                            "point": clean_text(
-                                str(point.get("point", "")), max_len=80
-                            ),
-                            "citation": clean_text(
-                                str(point.get("citation", "")), max_len=80
-                            ),
-                        }
-                        for point in points[:8]
-                        if str(point.get("point", "")).strip()
-                    ],
-                }
-            )
-
-        prompt = textwrap.dedent(
-            f"""
-            你是市场咨询公司高级研究员。请基于样本做“市场调研总结”。
-            只可使用输入样本，不得虚构，不输出建议动作。
-            样本:
-            {json.dumps(payload_rows, ensure_ascii=False)}
-
-            仅输出 JSON:
-            {{
-              "common_insights":"2-4句，描述主流卖点共性与市场主轴",
-              "opportunities":"2-4句，描述样本中的差异化表达现状",
-              "risks":"2-4句，描述竞争状态与同质化程度",
-              "market_tags":["标签1","标签2"]
-            }}
-            """
-        ).strip()
-        payload = self._generate_json(prompt)
+            payload_rows.append({"item_id": item_id, "title": row.get("title", ""), "brand": row.get("brand", ""), "shop_name": row.get("shop_name", ""), "selling_points": [{"point": clean_text(str(point.get("point", "")), max_len=80), "citation": clean_text(str(point.get("citation", "")), max_len=80)} for point in points[:8] if str(point.get("point", "")).strip()]})
+        prompt = textwrap.dedent(f"""
+            \u4f60\u662f\u5e02\u573a\u54a8\u8be2\u516c\u53f8\u9ad8\u7ea7\u7814\u7a76\u5458\u3002\u8bf7\u57fa\u4e8e\u6837\u672c\u505a\u5e02\u573a\u8c03\u7814\u603b\u7ed3\u3002
+            \u6837\u672c\uff1a{json.dumps(payload_rows, ensure_ascii=False)}
+            \u4ec5\u8f93\u51fa JSON\uff0c\u5305\u542b common_insights\u3001opportunities\u3001risks\u3001market_tags\u3002
+        """).strip()
+        payload = self._generate_json(prompt, debug_meta={"stage": "llm_analyze_market_summary", "workbook_id": workbook_id, "task_id": task_id})
         if not isinstance(payload, dict):
-            return {
-                "summary_text": "",
-                "common_points": [],
-                "opportunities": [],
-                "risks": [],
-                "market_tags": [],
-                "updated_at": now_iso(),
-                "sample_size": len(rows),
-                "point_count": 0,
-            }
-
+            return {"summary_text": "", "common_points": [], "opportunities": [], "risks": [], "market_tags": [], "updated_at": now_iso(), "sample_size": len(rows), "point_count": 0}
         common = clean_text(str(payload.get("common_insights", "")), max_len=1200)
         opportunities = clean_text(str(payload.get("opportunities", "")), max_len=1200)
         risks = clean_text(str(payload.get("risks", "")), max_len=1200)
         tags = self._to_string_list(payload.get("market_tags"), max_len=30)[:10]
         if not common or not opportunities or not risks:
-            return {
-                "summary_text": "",
-                "common_points": [],
-                "opportunities": [],
-                "risks": [],
-                "market_tags": [],
-                "updated_at": now_iso(),
-                "sample_size": len(rows),
-                "point_count": 0,
-            }
-        summary_text = (
-            f"市场共性：{common}\n差异化分布：{opportunities}\n竞争状态：{risks}"
-        )
-        return {
-            "summary_text": summary_text,
-            "common_points": [common],
-            "opportunities": [opportunities],
-            "risks": [risks],
-            "market_tags": tags,
-            "updated_at": now_iso(),
-            "sample_size": len(rows),
-            "point_count": sum(
-                len(workbook_points_map.get(r.get("item_id", ""), [])) for r in rows
-            ),
-        }
+            return {"summary_text": "", "common_points": [], "opportunities": [], "risks": [], "market_tags": [], "updated_at": now_iso(), "sample_size": len(rows), "point_count": 0}
+        summary_text = f"\u5e02\u573a\u5171\u6027\uff1a{common}\n\u5dee\u5f02\u5316\u5206\u5e03\uff1a{opportunities}\n\u7ade\u4e89\u72b6\u6001\uff1a{risks}"
+        return {"summary_text": summary_text, "common_points": [common], "opportunities": [opportunities], "risks": [risks], "market_tags": tags, "updated_at": now_iso(), "sample_size": len(rows), "point_count": sum(len(workbook_points_map.get(r.get('item_id', ''), [])) for r in rows)}

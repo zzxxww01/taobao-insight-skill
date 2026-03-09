@@ -1,13 +1,77 @@
 ---
 name: taobao-insight
-description: Taobao/Tmall keyword product research and competitor analysis. Use when user asks for 淘宝/天猫商品调研、关键词选品、竞品分析、抓取N条商品、导出MD或HTML报告（例如：淘宝狗粮关键词调研20条）。
+description: Taobao/Tmall/JD keyword product research, competitor analysis, and standalone review crawling. Use when user asks for 淘宝/天猫/京东商品调研、关键词选品、竞品分析、抓取N条商品、导出MD或HTML报告，或明确要求爬取/抓取淘宝或京东商品评论（例如：淘宝狗粮关键词调研20条、京东口红调研20条、抓取京东某商品近7天评论）。
 ---
 
-# 淘宝市场调研
+# 淘宝/京东市场调研
 
 原生 CDP 自动化抓取 + 大模型卖点提炼。按以下 5 阶段顺序执行，不要跳步。
 
 > Windows 下所有 Python 命令前必须设置 `PYTHONIOENCODING=utf-8`。
+
+---
+
+## 京东支持补充
+
+- 京东命令使用 `jd-analyze-keyword` 或 `jd-final-csv`
+- 京东关键词示例：`口红`
+- 京东商品链接示例：`https://item.jd.com/8142476.html`
+- 京东登录/风控恢复必须沿用淘宝同一套浏览器设计：
+  - 默认 `raw CDP`
+  - CDP 初始化失败时自动降级到 `Playwright persistent`
+  - 不要额外引入另一套登录浏览器主链路
+- 京东默认使用独立会话参数：
+  - `JD_BROWSER_MODE`
+  - `JD_STORAGE_STATE_FILE`
+  - `JD_USER_DATA_DIR`
+  - `JD_MANUAL_LOGIN_TIMEOUT_SEC`
+- 当用户明确是京东任务时：
+  - 关键词模式运行 `python scripts/pipeline.py jd-final-csv "<keyword>" ...`
+  - 链接模式运行 `python scripts/pipeline.py jd-final-csv "<placeholder_keyword>" --item-url "<url>" ...`
+  - 不要混用淘宝的 `TAOBAO_*` session 路径
+
+---
+
+## 评论抓取独立入口
+
+当用户明确说“爬取评论 / 抓评论 / 导出评论 / 京东评论 / 淘宝评论 / 评价抓取”时，不要走现有商品分析 pipeline，改走独立入口 `scripts/review_pipeline.py`。
+
+评论抓取模式的原则：
+- 只抓取并导出评论原始数据，不做商品分析、卖点总结、HTML/Markdown 调研报告
+- 输入只接受商品 `URL/ID/URL 文件`
+- 输出固定为 `JSONL + CSV + run-summary.json + run-summary.md`
+- 默认输出目录为 `data/reviews_exports/<platform>/<direct|search>/<task>/`
+- 单商品直抓时，目录名优先用 `item_id`，例如 `data/reviews_exports/jd/direct/100259348596-d5-all-20260309-001459`
+
+常用命令：
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python scripts/review_pipeline.py jd-reviews <task_name> --item-url "<JD商品URL>" --days 7 --limit 0
+python scripts/review_pipeline.py taobao-reviews <task_name> --item-url "<淘宝/天猫商品URL>" --days 7 --limit 0
+```
+
+更多输入方式：
+
+```powershell
+python scripts/review_pipeline.py jd-reviews <task_name> --item-id <item_id> --days 7 --limit 0
+python scripts/review_pipeline.py jd-reviews <task_name> --item-urls-file "<urls.txt>" --days 7 --limit 0
+```
+
+参数语义：
+- `--days N`：最近 N 天；大于 0 时优先于 `--months`
+- `--months N`：最近 N 个月；默认 `2`
+- `--limit N`：每个商品最多保留 N 条评论；`0` 表示时间窗口内尽量全抓
+- `--output-dir <path>`：自定义输出目录
+- `--jd-browser-mode cdp|persistent`
+- `--taobao-browser-mode cdp|persistent`
+
+评论抓取完成后，必须向用户回报：
+- 输出目录
+- `total_reviews`
+- 每个商品的 `count`
+- `stopped_reason`
+- 如果发生 CDP 降级或登录恢复，也要说明
 
 ---
 
@@ -25,6 +89,34 @@ $env:PYTHONIOENCODING="utf-8"; python scripts/check_env.py
 ---
 
 ## 阶段 2: 解析意图
+
+先判断任务是不是“独立评论抓取”。
+
+### 2.0 评论抓取触发规则
+
+只要用户明确提到以下意图之一，就走评论抓取独立入口，不进入阶段 3 的分析 pipeline：
+- “爬取评论”
+- “抓评论”
+- “导出评论”
+- “淘宝评论”
+- “京东评论”
+- “评价抓取”
+
+评论抓取时提取四类参数：
+- `platform`: `taobao` / `jd`
+- `input_mode`: `item_urls` / `item_ids` / `item_urls_file`
+- `days_or_months`: 时间窗口，优先 `days`
+- `limit`: 评论上限；未指定时默认 `100`，明确说“全部”时用 `0`
+
+若命中评论抓取意图，则直接运行：
+
+```powershell
+python scripts/review_pipeline.py <taobao-reviews|jd-reviews> <task_name> ...
+```
+
+不要继续套用下面的关键词调研逻辑。
+
+### 2.1 商品分析/调研任务
 
 从用户指令中提取三类参数：
 - `input_mode`: 输入模式（`keyword` / `item_urls` / `item_urls_file`）
@@ -56,6 +148,9 @@ $env:PYTHONIOENCODING="utf-8"; python scripts/check_env.py
 ---
 
 ## 阶段 3: 执行抓取
+
+本阶段只适用于商品分析/调研任务。
+如果当前任务是评论抓取，跳过本阶段，改用上面的 `review_pipeline.py` 命令模板。
 
 **运行前必须告知用户**：
 > 爬虫即将开始，浏览器将自动启动。如果跳转到登录页面，程序会自动暂停等待您扫码，登录后自动继续。
@@ -173,6 +268,7 @@ Markdown: skills/taobao-insight/data/exports/<keyword>-top<N>.md
 
 | 错误信息 | 处理方式 |
 |---|---|
+| 评论任务只抓到很少几条 | 优先检查是否走到了评论独立入口 `review_pipeline.py`，不要误用分析 pipeline |
 | 环境检测失败 | 检查 Python 依赖和 `.env` 配置 |
 | 浏览器启动失败 | 关闭所有 Chrome 进程后重试 |
 | `Chrome/Edge executable not found` | 设置 `CUSTOM_BROWSER_PATH` 环境变量 |

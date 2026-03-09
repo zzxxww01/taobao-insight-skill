@@ -54,6 +54,7 @@ BACKEND_PRODUCT_COLUMNS = [
     "updated_at",
 ]
 EXTENDED_PRODUCT_COLUMNS = [
+    "platform",
     "search_rank",
     "sales_text",
     "official_store",
@@ -66,9 +67,14 @@ MAX_TOP_N = 100
 DEFAULT_GROUP_CODE = "1"
 DEFAULT_GROUP_NAME = "default-group"
 TAOBAO_DOMAINS = ("taobao.com", "tmall.com")
+JD_DOMAINS = ("jd.com", "3.cn")
 
 ITEM_URL_RE = re.compile(
     r"https?://(?:item\.taobao\.com|detail\.tmall\.com)/item\.htm\?[^\"'\s<>]+",
+    re.IGNORECASE,
+)
+JD_ITEM_URL_RE = re.compile(
+    r"https?://item\.jd\.com/(?P<id>\d{6,})\.html(?:\?[^\"'\s<>]*)?",
     re.IGNORECASE,
 )
 ANY_URL_RE = re.compile(r"https?://[^\"'\s<>]+", re.IGNORECASE)
@@ -76,35 +82,42 @@ ITEM_ID_IN_TEXT_RE = re.compile(
     r"(?:[?&]|%3[fF]|%26)id(?:=|%3[dD])(\d{6,})", re.IGNORECASE
 )
 JSON_ITEM_ID_RE = re.compile(
-    r'"(?:itemId|item_id|nid|itemid)"\s*:\s*"?(?P<id>\d{6,})"?', re.IGNORECASE
+    r'"(?:itemId|item_id|nid|itemid|skuId|skuid|wareId|wareid)"\s*:\s*"?(?P<id>\d{6,})"?',
+    re.IGNORECASE,
 )
 ITEM_ID_RE = re.compile(r"(?:^|[?&])id=(\d{6,})", re.IGNORECASE)
 SKU_ID_RE = re.compile(r"(?:^|[?&])skuId=(\d{6,})", re.IGNORECASE)
 DIGITS_ONLY_RE = re.compile(r"^\d{6,}$")
 TMALL_HINT_RE = re.compile(r"(tmall\.com|tmall\.hk|detail\.tmall)", re.IGNORECASE)
+JD_HINT_RE = re.compile(r"(?:^|[/.])jd\.com(?:[/?#:]|$)|360buy", re.IGNORECASE)
 OFFICIAL_SHOP_MARKER_RE = re.compile(
-    r"^(?!.*百亿补贴).*(官方|旗舰店|天猫.*自营|自营.*天猫)", re.IGNORECASE
+    r"^(?!.*百亿补贴).*(官方|旗舰店|天猫.*自营|自营.*天猫|京东.*自营|自营.*京东|京东自营)",
+    re.IGNORECASE,
 )
 SALES_TEXT_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(万)?\+?\s*(?:人付款|已售)", re.IGNORECASE
+    r"(\d+(?:\.\d+)?)\s*(万)?\+?\s*(?:人付款|已售)",
+    re.IGNORECASE,
 )
 PRICE_RE = re.compile(r"(?<!\d)(\d{1,6}(?:\.\d{1,2})?)(?!\d)")
 SKU_MAP_RE = re.compile(
-    r'"skuId"\s*:\s*"(?P<sku_id>\d{6,})".{0,260}?"price"\s*:\s*"?(?P<price>\d+(?:\.\d{1,2})?)"?',
+    r'"skuId"\s*:\s*"?(?P<sku_id>\d{6,})"?'
+    r'.{0,260}?"price"\s*:\s*"?(?P<price>\d+(?:\.\d{1,2})?)"?',
     re.IGNORECASE | re.DOTALL,
 )
-SHOP_NAME_RE = re.compile(r'"(?:shopName|sellerNick)"\s*:\s*"(?P<name>[^"]+)"')
+SHOP_NAME_RE = re.compile(
+    r'"(?:shopName|sellerNick|shopNameStr)"\s*:\s*"(?P<name>[^"]+)"'
+)
 BRAND_RE = re.compile(r'"(?:brandName|brand)"\s*:\s*"(?P<brand>[^"]+)"', re.IGNORECASE)
 LINE_BREAK_RE = re.compile(r"[\r\n]+")
 WHITESPACE_RE = re.compile(r"\s+")
 NON_WORD_RE = re.compile(r"[^\w\u4e00-\u9fff]+", re.UNICODE)
 BANNED_SHOP_MARKER_RE = re.compile(r"(?!)")
 TITLE_SITE_SUFFIX_RE = re.compile(
-    r"(?:[-_｜|·•\s]*(?:tmall\.com天猫|taobao\.com淘宝网|tmall\.com|taobao\.com|天猫|淘宝网))+\s*$",
+    r"(?:[-_|·•\s]*(?:tmall\.com天猫|taobao\.com淘宝网|jd\.com京东|tmall\.com|taobao\.com|jd\.com|天猫|淘宝网|京东))+\s*$",
     re.IGNORECASE,
 )
 SHOP_SUFFIX_RE = re.compile(
-    r"(官方旗舰店|旗舰店|官方店|专卖店|专营店|海外旗舰店|品牌店|天猫国际官方直营)$",
+    r"(官方旗舰店|旗舰店|官方店|专卖店|专营店|海外旗舰店|品牌店|天猫国际官方直营|京东自营旗舰店|京东自营)$",
     re.IGNORECASE,
 )
 SHOP_TRAILING_CATEGORY_RE = re.compile(
@@ -137,7 +150,7 @@ BRAND_PRODUCT_KEYWORD_RE = re.compile(
     re.IGNORECASE,
 )
 SEARCH_BLOCK_HINT = (
-    "Taobao search was blocked by anti-bot or login validation. "
+    "Search was blocked by anti-bot or login validation. "
     "Recommended: run in default raw-CDP mode with a signed-in real browser profile "
     "(optionally set --playwright-cdp-url to attach an existing session), "
     "or pass direct item URLs by --item-url / --item-urls-file."
@@ -147,9 +160,13 @@ ANTI_BOT_MARKERS = [
     "FAIL_SYS_USER_VALIDATE",
     "x5secdata",
     "_____tmd_____",
-    "被挤爆",
+    "被拦截",
     "captcha",
     "punish",
+    "JDR_shields",
+    "risk_handler",
+    "京东验证",
+    "安全验证",
 ]
 TITLE_POINT_RULES: list[tuple[str, str]] = [
     ("防水防汗", "强调防水防汗场景"),
@@ -191,7 +208,7 @@ def load_simple_dotenv(path: Path) -> None:
 
 
 # LLM concurrency settings
-CRAWL_WORKERS = 1  # Default concurrent workers for Taobao crawling
+CRAWL_WORKERS = 1  # Default concurrent workers for marketplace crawling
 LLM_WORKERS = 64  # Max concurrent workers for Flash/Vision models (extraction, analysis)
 LLM_WORKERS_MIN = 32  # Min concurrent workers after transient errors
 LLM_WORKERS_PRO = 16  # Concurrent workers for Pro/Preview models (market report)
