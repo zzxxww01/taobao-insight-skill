@@ -264,7 +264,16 @@ def looks_like_review_dict(row: dict[str, Any]) -> bool:
         return False
     keys = {str(key).lower() for key in row.keys()}
     text_keys = {"content", "commentdata", "commenttext", "ratecontent", "feedback", "text"}
-    time_keys = {"creationtime", "commenttime", "commentdate", "ratedate", "time", "date"}
+    time_keys = {
+        "creationtime",
+        "commenttime",
+        "commentdate",
+        "ratedate",
+        "feedbackdate",
+        "datetime",
+        "time",
+        "date",
+    }
     identity_keys = {"commentid", "guid", "comment_id", "id"}
     review_meta_keys = {
         "commentscore",

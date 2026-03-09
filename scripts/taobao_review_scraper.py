@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import hashlib
 import json
 import logging
+import re
+import time
+import urllib.parse
 from typing import Any
 
 from data import clean_text, extract_json_object, normalize_brand_name, normalize_item_title, now_iso
@@ -26,13 +31,26 @@ from review_common import (
     utc_now_local,
 )
 from review_models import ReviewItemResult, ReviewRecord
-from scraper import Crawler
+from scraper import (
+    Crawler,
+    _browser_fetch_text_via_page,
+    _browser_user_agent,
+    _cookie_header_for_domains,
+    _http_fetch_text_with_cookie_header,
+    _read_storage_state_cookies,
+)
 from tools.browser_manager import get_global_browser_manager
 
 LOG = logging.getLogger("taobao_insight")
 
 
 class TaobaoReviewCrawler(Crawler):
+    RATE_API = "mtop.taobao.rate.detaillist.get"
+    RATE_API_VERSION = "6.0"
+    H5_APP_KEY = "12574478"
+    H5_JSV = "2.7.5"
+    RATE_PAGE_SIZE = 50
+
     @staticmethod
     def _is_review_response_url(url: str) -> bool:
         lowered = str(url or "").strip().lower()
@@ -56,6 +74,259 @@ class TaobaoReviewCrawler(Crawler):
         shop_name = self._extract_shop_name(html, body_text)
         brand = normalize_brand_name(self._extract_brand(title, html), title=title, shop_name=shop_name)
         return title, shop_name, brand
+
+    @staticmethod
+    def _normalize_user_name(value: Any) -> str:
+        text = clean_text(str(value or ""), max_len=40)
+        if not text:
+            return ""
+        if "*" in text:
+            return text
+        return mask_user_name(text)
+
+    @staticmethod
+    def _flatten_rate_tags(value: Any) -> list[str]:
+        if isinstance(value, list):
+            tags: list[str] = []
+            for row in value:
+                if isinstance(row, dict):
+                    tag = clean_text(
+                        str(
+                            row.get("title")
+                            or row.get("text")
+                            or row.get("name")
+                            or row.get("tag")
+                            or row.get("label")
+                            or ""
+                        ),
+                        max_len=40,
+                    )
+                else:
+                    tag = clean_text(str(row or ""), max_len=40)
+                if tag:
+                    tags.append(tag)
+            return flatten_tags(tags)
+        return flatten_tags(value)
+
+    @staticmethod
+    def _flatten_sku_map(value: Any) -> str:
+        if isinstance(value, dict):
+            pairs: list[str] = []
+            for key, raw_value in value.items():
+                key_text = clean_text(str(key or ""), max_len=40)
+                value_text = clean_text(str(raw_value or ""), max_len=80)
+                if key_text and value_text:
+                    pairs.append(f"{key_text}:{value_text}")
+                elif value_text:
+                    pairs.append(value_text)
+            return clean_text(" | ".join(pairs), max_len=200)
+        return clean_text(str(value or ""), max_len=200)
+
+    def _parse_taobao_review_datetime(self, value: Any) -> dt.datetime | None:
+        base_now = utc_now_local()
+        text = clean_text(str(value or ""), max_len=120)
+        if text:
+            match = re.match(r"^\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*$", text)
+            if match:
+                return dt.datetime(
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                    23,
+                    59,
+                    59,
+                    tzinfo=base_now.tzinfo,
+                )
+            match = re.match(r"^\s*(\d{1,2})月(\d{1,2})日\s*$", text)
+            if match:
+                candidate = dt.datetime(
+                    base_now.year,
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    23,
+                    59,
+                    59,
+                    tzinfo=base_now.tzinfo,
+                )
+                if candidate > base_now + dt.timedelta(days=2):
+                    candidate = candidate.replace(year=base_now.year - 1)
+                return candidate
+        parsed = parse_review_datetime(value, now=base_now)
+        if parsed is None:
+            return None
+        if parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0 and text and any(mark in text for mark in ("年", "月", "日")):
+            return parsed.replace(hour=23, minute=59, second=59)
+        return parsed
+
+    def _extract_h5_token(self) -> str:
+        for cookie in _read_storage_state_cookies(self.storage_state_file):
+            name = str(cookie.get("name") or "")
+            domain = str(cookie.get("domain") or "").lower()
+            value = str(cookie.get("value") or "").strip()
+            if name == "_m_h5_tk" and value and ("tmall.com" in domain or "taobao.com" in domain):
+                return value.split("_", 1)[0]
+        return ""
+
+    def _build_signed_rate_api_url(self, request_data: dict[str, Any]) -> str:
+        token = self._extract_h5_token()
+        if not token:
+            raise RuntimeError("taobao review api token not found in storage state")
+        data_text = json.dumps(request_data, ensure_ascii=False, separators=(",", ":"))
+        timestamp = str(int(time.time() * 1000))
+        sign_payload = f"{token}&{timestamp}&{self.H5_APP_KEY}&{data_text}"
+        sign = hashlib.md5(sign_payload.encode("utf-8")).hexdigest()
+        params = {
+            "jsv": self.H5_JSV,
+            "appKey": self.H5_APP_KEY,
+            "t": timestamp,
+            "sign": sign,
+            "api": self.RATE_API,
+            "v": self.RATE_API_VERSION,
+            "isSec": "0",
+            "ecode": "1",
+            "timeout": "20000",
+            "type": "jsonp",
+            "dataType": "jsonp",
+            "callback": "mtopjsonp1",
+            "data": data_text,
+        }
+        return (
+            f"https://h5api.m.tmall.com/h5/{self.RATE_API}/{self.RATE_API_VERSION}/?"
+            + urllib.parse.urlencode(params)
+        )
+
+    async def _fetch_rate_payload_text_async(
+        self,
+        page: Any,
+        *,
+        referer_url: str,
+        request_data: dict[str, Any],
+    ) -> str:
+        signed_url = self._build_signed_rate_api_url(request_data)
+        cookie_header = _cookie_header_for_domains(
+            self.storage_state_file,
+            allowed_domain_tokens=("tmall.com", "taobao.com"),
+        )
+        if not cookie_header:
+            raise RuntimeError("taobao review api cookie header is empty")
+        user_agent = (await _browser_user_agent(page)) or "Mozilla/5.0"
+        try:
+            return _http_fetch_text_with_cookie_header(
+                signed_url,
+                user_agent=user_agent,
+                referer=referer_url,
+                accept="*/*",
+                cookie_header=cookie_header,
+                timeout_sec=30,
+                max_len=2_000_000,
+            )
+        except Exception as exc:
+            LOG.debug("taobao review api http fetch failed, fallback to browser fetch: %s", exc)
+        return await _browser_fetch_text_via_page(page, signed_url, accept="*/*", max_len=2_000_000)
+
+    @staticmethod
+    def _load_payload_dict(payload_text: str) -> dict[str, Any] | None:
+        if not payload_text:
+            return None
+        try:
+            payload = json.loads(payload_text)
+        except Exception:
+            payload = extract_json_object(payload_text)
+        return payload if isinstance(payload, dict) else None
+
+    def _page_crossed_cutoff(self, records: list[ReviewRecord], cutoff: dt.datetime) -> bool:
+        parsed_values: list[dt.datetime] = []
+        for record in records:
+            parsed = parse_review_datetime(record.comment_time)
+            if parsed is not None:
+                parsed_values.append(parsed)
+        if not parsed_values:
+            return False
+        return min(parsed_values).date() < cutoff.date()
+
+    async def _collect_reviews_via_rate_api_async(
+        self,
+        page: Any,
+        *,
+        item_id: str,
+        item_url: str,
+        title: str,
+        shop_name: str,
+        brand: str,
+        cutoff: dt.datetime,
+        limit: int,
+    ) -> tuple[list[ReviewRecord], str]:
+        all_reviews: dict[str, ReviewRecord] = {}
+        page_no = 1
+        stop_reason = "no_reviews_found"
+        effective_limit = int(limit)
+        if effective_limit <= 0:
+            max_pages = 400
+        else:
+            max_pages = max(4, min(200, (max(1, effective_limit) // self.RATE_PAGE_SIZE) + 10))
+
+        while page_no <= max_pages:
+            payload_text = await self._fetch_rate_payload_text_async(
+                page,
+                referer_url=item_url,
+                request_data={
+                    "auctionNumId": item_id,
+                    "pageNo": page_no,
+                    "pageSize": self.RATE_PAGE_SIZE,
+                    "orderType": "feedbackdate",
+                },
+            )
+            payload = self._load_payload_dict(payload_text)
+            if payload is None:
+                raise RuntimeError("taobao review rate api returned empty payload")
+            ret = [str(value or "") for value in (payload.get("ret") or [])]
+            if ret and not any(value.startswith("SUCCESS") for value in ret):
+                raise RuntimeError("; ".join(ret))
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            rows = data.get("rateList") if isinstance(data.get("rateList"), list) else []
+            page_records: list[ReviewRecord] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                record = self._record_from_api_dict(
+                    row,
+                    item_id=item_id,
+                    item_url=item_url,
+                    title=title,
+                    shop_name=shop_name,
+                    brand=brand,
+                )
+                if record is not None:
+                    page_records.append(record)
+            if not page_records:
+                if all_reviews:
+                    stop_reason = "empty_rate_page"
+                break
+
+            for record in page_records:
+                all_reviews[record.identity()] = record
+
+            final_reviews = filter_and_limit_reviews(
+                list(all_reviews.values()),
+                cutoff=cutoff,
+                limit=effective_limit,
+            )
+            if effective_limit > 0 and len(final_reviews) >= effective_limit:
+                stop_reason = "limit_reached"
+                return final_reviews, stop_reason
+            if self._page_crossed_cutoff(page_records, cutoff):
+                stop_reason = "reached_cutoff"
+                return final_reviews, stop_reason
+            if not normalize_bool(data.get("hasNext")):
+                stop_reason = "no_more_rate_pages"
+                return final_reviews, stop_reason
+            page_no += 1
+
+        return filter_and_limit_reviews(
+            list(all_reviews.values()),
+            cutoff=cutoff,
+            limit=effective_limit,
+        ), stop_reason
 
     async def _open_review_surface_async(self, page: Any) -> bool:
         selectors = [
@@ -243,9 +514,10 @@ class TaobaoReviewCrawler(Crawler):
                 max_len=600,
             )
             append_time = format_review_datetime(
-                parse_review_datetime(
+                self._parse_taobao_review_datetime(
                     pick_first_non_empty(
                         append_payload,
+                        "feedbackDate",
                         "time",
                         "date",
                         "commentTime",
@@ -255,14 +527,28 @@ class TaobaoReviewCrawler(Crawler):
             )
         if not text and not append_text:
             return None
+        interact_info = row.get("interactInfo") if isinstance(row.get("interactInfo"), dict) else {}
+        sku_info = compose_text_parts(
+            [
+                row.get("auctionSku"),
+                row.get("skuInfo"),
+                row.get("spec"),
+                row.get("skuValueStr"),
+                self._flatten_sku_map(row.get("skuMap")),
+            ],
+            max_len=200,
+        )
         comment_time = format_review_datetime(
-            parse_review_datetime(
+            self._parse_taobao_review_datetime(
                 pick_first_non_empty(
                     row,
+                    "feedbackDate",
+                    "dateTime",
                     "rateDate",
                     "commentTime",
                     "date",
                     "time",
+                    "createTime",
                 )
             )
         )
@@ -274,35 +560,59 @@ class TaobaoReviewCrawler(Crawler):
             shop_name=shop_name,
             brand=brand,
             comment_id=clean_text(
-                str(pick_first_non_empty(row, "rateId", "commentId", "id") or ""),
+                str(pick_first_non_empty(row, "rateId", "commentId", "id", "feedId") or ""),
                 max_len=120,
             ),
             comment_time=comment_time,
             comment_text=text,
             rating=clean_text(str(pick_first_non_empty(row, "rateScore", "score", "star") or ""), max_len=20),
-            sku_info=compose_text_parts(
-                [
-                    row.get("auctionSku"),
-                    row.get("skuInfo"),
-                    row.get("spec"),
-                ],
-                max_len=200,
+            sku_info=sku_info,
+            user_name_masked=self._normalize_user_name(
+                pick_first_non_empty(
+                    row,
+                    "displayUserNick",
+                    "nick",
+                    "nickName",
+                    "userNick",
+                    "reduceUserNick",
+                    "userName",
+                )
             ),
-            user_name_masked=mask_user_name(
-                pick_first_non_empty(row, "displayUserNick", "nick", "nickName", "userNick")
+            user_level=clean_text(
+                str(pick_first_non_empty(row, "memberLevel", "userLevel", "creditLevel") or ""),
+                max_len=60,
             ),
-            user_level=clean_text(str(pick_first_non_empty(row, "memberLevel", "userLevel") or ""), max_len=60),
             is_anonymous=normalize_bool(
                 pick_first_non_empty(row, "anonymous", "anonymousFlag", "isAnonymous")
             ),
             is_append=bool(append_text),
             append_time=append_time,
             append_text=append_text,
-            like_count=normalize_int(pick_first_non_empty(row, "useful", "likeCount", "praiseCount")),
-            reply_count=normalize_int(pick_first_non_empty(row, "replyCount", "replyCnt")),
-            has_images=bool(pick_first_non_empty(row, "pics", "images", "photos")),
-            has_video=bool(pick_first_non_empty(row, "video", "videos")),
-            raw_tags=flatten_tags(pick_first_non_empty(row, "tags", "tagList", "labels")),
+            like_count=normalize_int(
+                pick_first_non_empty(
+                    interact_info,
+                    "likeCount",
+                    "praiseCount",
+                )
+                or pick_first_non_empty(row, "useful", "likeCount", "praiseCount")
+            ),
+            reply_count=normalize_int(
+                pick_first_non_empty(interact_info, "commentCount")
+                or pick_first_non_empty(row, "replyCount", "replyCnt")
+            ),
+            has_images=bool(
+                pick_first_non_empty(
+                    row,
+                    "feedPicList",
+                    "pics",
+                    "images",
+                    "photos",
+                )
+            ),
+            has_video=bool(pick_first_non_empty(row, "feedVideo", "video", "videos")),
+            raw_tags=self._flatten_rate_tags(
+                pick_first_non_empty(row, "rateTagList", "tags", "tagList", "labels")
+            ),
             raw_source={"source": "api", "row": row},
             collected_at=now_iso(),
         )
@@ -444,12 +754,51 @@ class TaobaoReviewCrawler(Crawler):
                 await page.wait_for_timeout(max(3500, self.manual_wait_seconds * 1000))
 
             title, shop_name, brand = await self._extract_product_metadata_async(page)
+            await self._persist_storage_state_async(context)
+
+            try:
+                api_reviews, stop_reason = await self._collect_reviews_via_rate_api_async(
+                    page,
+                    item_id=item_id,
+                    item_url=url,
+                    title=title,
+                    shop_name=shop_name,
+                    brand=brand,
+                    cutoff=cutoff,
+                    limit=effective_limit,
+                )
+            except Exception as exc:
+                LOG.warning("taobao review rate api collection failed for item_id=%s: %s", item_id, exc)
+                api_reviews = []
+                stop_reason = ""
+
+            if api_reviews:
+                final_reviews = filter_and_limit_reviews(
+                    api_reviews,
+                    cutoff=cutoff,
+                    limit=effective_limit,
+                )
+                await self._persist_storage_state_async(context)
+                return ReviewItemResult(
+                    platform="taobao",
+                    item_id=item_id,
+                    item_url=url,
+                    title=title,
+                    shop_name=shop_name,
+                    brand=brand,
+                    reviews=final_reviews,
+                    collected_count=len(final_reviews),
+                    cutoff_time=cutoff.isoformat(timespec="seconds"),
+                    stopped_reason=stop_reason,
+                    login_recovery_events=self.login_recovery_events[login_event_start:],
+                )
+
             await self._open_review_surface_async(page)
 
             all_reviews: dict[str, ReviewRecord] = {}
             response_cursor = 0
             stale_rounds = 0
-            stop_reason = "no_reviews_found"
+            stop_reason = stop_reason or "no_reviews_found"
             if effective_limit <= 0:
                 max_rounds = 40
             else:
