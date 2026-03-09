@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 
 from config import (
+    LOGGER_NAME,
     TITLE_POINT_RULES,
     UA,
 )
@@ -34,7 +35,7 @@ from data import (
     _extract_brand_token,
 )
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 
 class TransientGeminiError(RuntimeError):

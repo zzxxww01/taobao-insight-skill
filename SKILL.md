@@ -1,9 +1,9 @@
 ---
-name: taobao-insight
+name: ecom-research-skill
 description: Taobao/Tmall/JD keyword product research, competitor analysis, and standalone review crawling. Use when user asks for 淘宝/天猫/京东商品调研、关键词选品、竞品分析、抓取N条商品、导出MD或HTML报告，或明确要求爬取/抓取淘宝或京东商品评论（例如：淘宝狗粮关键词调研20条、京东口红调研20条、抓取京东某商品近7天评论）。
 ---
 
-# 淘宝/京东市场调研
+# 淘宝京东商品调研
 
 原生 CDP 自动化抓取 + 大模型卖点提炼。按以下 5 阶段顺序执行，不要跳步。
 
@@ -157,10 +157,10 @@ python scripts/review_pipeline.py <taobao-reviews|jd-reviews> <task_name> ...
 
 **执行命令**（PowerShell）：
 ```powershell
-cd skills/taobao-insight
+cd skills/ecom-research-skill
 $env:PYTHONIOENCODING="utf-8"
-$env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\taobao_insight_profile"
-$env:TAOBAO_STORAGE_STATE_FILE="skills\\taobao-insight\\data\\taobao_storage_state.json"
+$env:TAOBAO_USER_DATA_DIR="$env:APPDATA\\ecom_research_taobao_profile"
+$env:TAOBAO_STORAGE_STATE_FILE="skills\\ecom-research-skill\\data\\ecom_research_taobao_storage_state.json"
 python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<keyword>" --top-n <top_n> --output "data/exports/<keyword>-top<top_n>.md" --html-output "data/exports/<keyword>-top<top_n>.html"
 ```
 
@@ -200,8 +200,8 @@ python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<placeh
 - 终端出现 `login page content detected` 是正常的扫码等待日志，不要重试
 
 **环境变量持久化**（避免重复扫码）：
-- 必须固定 `TAOBAO_USER_DATA_DIR`（建议 `%APPDATA%\taobao_insight_profile`）
-- 必须固定 `TAOBAO_STORAGE_STATE_FILE`（建议 `data/taobao_storage_state.json`）
+- 必须固定 `TAOBAO_USER_DATA_DIR`（建议 `%APPDATA%\ecom_research_taobao_profile`）
+- 必须固定 `TAOBAO_STORAGE_STATE_FILE`（建议 `data/ecom_research_taobao_storage_state.json`）
 
 ---
 
@@ -234,8 +234,8 @@ python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "<placeh
 ```
 淘宝大盘深度调研完成！
 
-仪表盘: skills/taobao-insight/data/exports/<keyword>-top<N>.html
-Markdown: skills/taobao-insight/data/exports/<keyword>-top<N>.md
+仪表盘: skills/ecom-research-skill/data/exports/<keyword>-top<N>.html
+Markdown: skills/ecom-research-skill/data/exports/<keyword>-top<N>.md
 
 市场缩影：
 - 样本量：20 个商品（成功 18 / 失败 2）

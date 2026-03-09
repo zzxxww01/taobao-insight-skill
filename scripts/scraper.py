@@ -43,11 +43,16 @@ from config import (
     ANTI_BOT_MARKERS,
     BANNED_SHOP_MARKER_RE,
     BRAND_RE,
+    LOGGER_NAME,
     LINE_BREAK_RE,
     NON_WORD_RE,
     SEARCH_BLOCK_HINT,
     SHOP_NAME_RE,
     SKU_MAP_RE,
+    platform_default_profile_name,
+    platform_default_storage_state_name,
+    resolved_storage_state_file,
+    resolved_user_data_dir,
 )
 from data import (
     ItemDetail,
@@ -65,7 +70,7 @@ from data import (
     read_text_utf8_best,
 )
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 
 def detect_antibot_signal(*texts: str) -> str:
@@ -225,13 +230,8 @@ def load_url_lines(path: str | None) -> list[str]:
     return lines
 
 
-def _default_user_data_dir(profile_name: str = "taobao_insight_profile") -> Path:
-    appdata = os.getenv("APPDATA", "")
-    if appdata:
-        return Path(appdata) / profile_name
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / profile_name
-    return Path.home() / ".config" / profile_name
+def _default_user_data_dir(platform: str = "taobao") -> Path:
+    return resolved_user_data_dir(platform)
 
 
 def _cdp_http_base(cdp_url: str) -> str:
@@ -280,8 +280,9 @@ def list_cdp_pages(cdp_url: str) -> list[dict[str, str]]:
 
 
 class SearchClient:
-    DEFAULT_STORAGE_STATE_FILE = "taobao_storage_state.json"
-    DEFAULT_USER_DATA_DIR_NAME = "taobao_insight_profile"
+    PLATFORM_KEY = "taobao"
+    DEFAULT_STORAGE_STATE_FILE = platform_default_storage_state_name(PLATFORM_KEY)
+    DEFAULT_USER_DATA_DIR_NAME = platform_default_profile_name(PLATFORM_KEY)
     PLATFORM_LABEL = "Taobao"
     LOGIN_HANDLER_CLS = TaobaoLogin
     DETECT_NON_PRODUCT_PAGE_FN = staticmethod(detect_non_product_page)
@@ -305,13 +306,13 @@ class SearchClient:
         self.storage_state_file = (
             Path(storage_state_file).resolve()
             if storage_state_file
-            else Path("data") / self.DEFAULT_STORAGE_STATE_FILE
+            else resolved_storage_state_file(self.PLATFORM_KEY)
         )
         self.storage_state_file = self.storage_state_file.resolve()
         self.user_data_dir = (
             Path(user_data_dir).resolve()
             if user_data_dir
-            else _default_user_data_dir(self.DEFAULT_USER_DATA_DIR_NAME).resolve()
+            else _default_user_data_dir(self.PLATFORM_KEY).resolve()
         )
         self.manual_login_timeout_sec = max(30, int(manual_login_timeout_sec))
 
@@ -771,8 +772,9 @@ class SearchClient:
 
 
 class Crawler:
-    DEFAULT_STORAGE_STATE_FILE = "taobao_storage_state.json"
-    DEFAULT_USER_DATA_DIR_NAME = "taobao_insight_profile"
+    PLATFORM_KEY = "taobao"
+    DEFAULT_STORAGE_STATE_FILE = platform_default_storage_state_name(PLATFORM_KEY)
+    DEFAULT_USER_DATA_DIR_NAME = platform_default_profile_name(PLATFORM_KEY)
     PLATFORM_LABEL = "Taobao"
     LOGIN_HANDLER_CLS = TaobaoLogin
     DETECT_NON_PRODUCT_PAGE_FN = staticmethod(detect_non_product_page)
@@ -798,13 +800,13 @@ class Crawler:
         self.storage_state_file = (
             Path(storage_state_file).resolve()
             if storage_state_file
-            else Path("data") / self.DEFAULT_STORAGE_STATE_FILE
+            else resolved_storage_state_file(self.PLATFORM_KEY)
         )
         self.storage_state_file = self.storage_state_file.resolve()
         self.user_data_dir = (
             Path(user_data_dir).resolve()
             if user_data_dir
-            else _default_user_data_dir(self.DEFAULT_USER_DATA_DIR_NAME).resolve()
+            else _default_user_data_dir(self.PLATFORM_KEY).resolve()
         )
         self.manual_login_timeout_sec = max(30, int(manual_login_timeout_sec))
         self._global_browser_manager: Any = None

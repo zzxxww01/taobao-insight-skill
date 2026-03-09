@@ -16,6 +16,7 @@ except ImportError:
 
 from config import (
     EXTENDED_PRODUCT_COLUMNS,
+    LOGGER_NAME,
     PRODUCT_COLUMNS,
     NON_WORD_RE,
 )
@@ -30,7 +31,7 @@ from data import (
 )
 from analysis import Analyzer
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 
 class ReportGenerator:

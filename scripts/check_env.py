@@ -17,7 +17,13 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from config import load_simple_dotenv
+from config import (
+    load_simple_dotenv,
+    platform_default_profile_name,
+    platform_default_storage_state_name,
+    resolved_storage_state_file,
+    resolved_user_data_dir,
+)
 
 try:
     from tools.login_rules import LOGIN_COOKIE_NAMES as TAOBAO_LOGIN_COOKIE_NAMES
@@ -54,8 +60,8 @@ PLATFORM_SPECS = {
         user_data_dir_env="TAOBAO_USER_DATA_DIR",
         storage_state_env="TAOBAO_STORAGE_STATE_FILE",
         manual_login_timeout_env="TAOBAO_MANUAL_LOGIN_TIMEOUT_SEC",
-        default_profile_name="taobao_insight_profile",
-        default_storage_state_name="taobao_storage_state.json",
+        default_profile_name=platform_default_profile_name("taobao"),
+        default_storage_state_name=platform_default_storage_state_name("taobao"),
     ),
     "jd": PlatformSpec(
         key="jd",
@@ -66,8 +72,8 @@ PLATFORM_SPECS = {
         user_data_dir_env="JD_USER_DATA_DIR",
         storage_state_env="JD_STORAGE_STATE_FILE",
         manual_login_timeout_env="JD_MANUAL_LOGIN_TIMEOUT_SEC",
-        default_profile_name="jd_insight_profile",
-        default_storage_state_name="jd_storage_state.json",
+        default_profile_name=platform_default_profile_name("jd"),
+        default_storage_state_name=platform_default_storage_state_name("jd"),
     ),
 }
 
@@ -114,26 +120,15 @@ def _parse_int(value: str, default: int) -> int:
 
 
 def _default_user_data_dir(spec: PlatformSpec) -> Path:
-    appdata = os.environ.get("APPDATA", "").strip()
-    if appdata:
-        return Path(appdata) / spec.default_profile_name
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / spec.default_profile_name
-    return Path.home() / ".config" / spec.default_profile_name
+    return resolved_user_data_dir(spec.key)
 
 
 def _default_storage_state_file(spec: PlatformSpec) -> Path:
-    env_value = (os.environ.get(spec.storage_state_env, "") or "").strip()
-    if env_value:
-        return Path(env_value)
-    candidates = [
-        ROOT_DIR / "backend" / "data" / spec.default_storage_state_name,
-        ROOT_DIR / "data" / spec.default_storage_state_name,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[1]
+    return resolved_storage_state_file(
+        spec.key,
+        root_dir=ROOT_DIR,
+        env_key=spec.storage_state_env,
+    )
 
 
 def _resolve_browser_mode(spec: PlatformSpec) -> str:

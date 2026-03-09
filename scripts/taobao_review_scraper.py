@@ -12,6 +12,7 @@ import time
 import urllib.parse
 from typing import Any
 
+from config import LOGGER_NAME
 from data import clean_text, extract_json_object, normalize_brand_name, normalize_item_title, now_iso
 from review_common import (
     compose_text_parts,
@@ -41,7 +42,7 @@ from scraper import (
 )
 from tools.browser_manager import get_global_browser_manager
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 
 class TaobaoReviewCrawler(Crawler):

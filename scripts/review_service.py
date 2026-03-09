@@ -7,9 +7,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from config import LOGGER_NAME
 from data import now_iso
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 from review_common import (
     filter_and_limit_reviews,

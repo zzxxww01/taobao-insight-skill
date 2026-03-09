@@ -22,12 +22,15 @@ from urllib.parse import quote_plus
 import datetime as dt
 
 from config import (
-    load_simple_dotenv,
-    DEFAULT_GROUP_CODE,
     MAX_TOP_N,
     CRAWL_WORKERS,
+    DEFAULT_GROUP_CODE,
+    LOGGER_NAME,
     LLM_WORKERS,
     LLM_WORKERS_MIN,
+    load_simple_dotenv,
+    resolved_storage_state_file,
+    resolved_user_data_dir,
 )
 from data import (
     GroupService,
@@ -59,7 +62,7 @@ from analysis import (
 )
 from report import ReportGenerator
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
 try:
@@ -69,17 +72,7 @@ except Exception:  # pragma: no cover
 
 
 def _default_user_data_dir(platform: str = "taobao") -> str:
-    from pathlib import Path
-
-    profile_name = "jd_insight_profile" if platform == "jd" else "taobao_insight_profile"
-    appdata = os.getenv("APPDATA", "")
-    if appdata:
-        return str(Path(appdata) / profile_name)
-    if sys.platform == "darwin":
-        return str(
-            Path.home() / "Library" / "Application Support" / profile_name
-        )
-    return str(Path.home() / ".config" / profile_name)
+    return str(resolved_user_data_dir(platform))
 
 
 def _safe_debug_slug(value: str) -> str:
@@ -2018,18 +2011,7 @@ def print_json(payload: Any) -> None:
 
 def _default_storage_state_file(platform: str = "taobao") -> str:
     env_key = "JD_STORAGE_STATE_FILE" if platform == "jd" else "TAOBAO_STORAGE_STATE_FILE"
-    default_name = "jd_storage_state.json" if platform == "jd" else "taobao_storage_state.json"
-    env_value = (os.getenv(env_key, "") or "").strip()
-    if env_value:
-        return env_value
-    candidates = [
-        Path(f"backend/data/{default_name}"),
-        Path(f"data/{default_name}"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return str(candidates[1])
+    return str(resolved_storage_state_file(platform, env_key=env_key))
 
 
 def build_parser() -> argparse.ArgumentParser:

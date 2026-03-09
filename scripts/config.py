@@ -6,7 +6,27 @@ import re
 import sys
 from pathlib import Path
 
-LOG = logging.getLogger("taobao_insight")
+PROJECT_DISPLAY_NAME = "淘宝京东商品调研"
+REPO_NAME = "ecom-research-skill"
+SKILL_NAME = "ecom-research-skill"
+LOGGER_NAME = "ecom_research_skill"
+
+PLATFORM_SESSION_DEFAULTS = {
+    "taobao": {
+        "profile_name": "ecom_research_taobao_profile",
+        "legacy_profile_names": ("taobao_insight_profile",),
+        "storage_state_name": "ecom_research_taobao_storage_state.json",
+        "legacy_storage_state_names": ("taobao_storage_state.json",),
+    },
+    "jd": {
+        "profile_name": "ecom_research_jd_profile",
+        "legacy_profile_names": ("jd_insight_profile",),
+        "storage_state_name": "ecom_research_jd_storage_state.json",
+        "legacy_storage_state_names": ("jd_storage_state.json",),
+    },
+}
+
+LOG = logging.getLogger(LOGGER_NAME)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PARENT_DIR = SCRIPT_DIR.parent
@@ -205,6 +225,84 @@ def load_simple_dotenv(path: Path) -> None:
         env_val = value.strip().strip('"').strip("'")
         if env_key and env_key not in os.environ:
             os.environ[env_key] = env_val
+
+
+def normalize_platform_key(platform: str) -> str:
+    return "jd" if str(platform or "").strip().lower() == "jd" else "taobao"
+
+
+def platform_default_profile_name(platform: str) -> str:
+    normalized = normalize_platform_key(platform)
+    return str(PLATFORM_SESSION_DEFAULTS[normalized]["profile_name"])
+
+
+def platform_legacy_profile_names(platform: str) -> tuple[str, ...]:
+    normalized = normalize_platform_key(platform)
+    values = PLATFORM_SESSION_DEFAULTS[normalized]["legacy_profile_names"]
+    return tuple(str(value) for value in values)
+
+
+def platform_default_storage_state_name(platform: str) -> str:
+    normalized = normalize_platform_key(platform)
+    return str(PLATFORM_SESSION_DEFAULTS[normalized]["storage_state_name"])
+
+
+def platform_legacy_storage_state_names(platform: str) -> tuple[str, ...]:
+    normalized = normalize_platform_key(platform)
+    values = PLATFORM_SESSION_DEFAULTS[normalized]["legacy_storage_state_names"]
+    return tuple(str(value) for value in values)
+
+
+def default_profile_path(profile_name: str) -> Path:
+    appdata = os.getenv("APPDATA", "").strip()
+    if appdata:
+        return Path(appdata) / profile_name
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / profile_name
+    return Path.home() / ".config" / profile_name
+
+
+def resolved_user_data_dir(platform: str) -> Path:
+    normalized = normalize_platform_key(platform)
+    preferred = default_profile_path(platform_default_profile_name(normalized))
+    if preferred.exists():
+        return preferred
+    for legacy_name in platform_legacy_profile_names(normalized):
+        legacy_path = default_profile_path(legacy_name)
+        if legacy_path.exists():
+            return legacy_path
+    return preferred
+
+
+def resolved_storage_state_file(
+    platform: str,
+    *,
+    root_dir: Path | None = None,
+    env_key: str | None = None,
+) -> Path:
+    if env_key:
+        env_value = (os.getenv(env_key, "") or "").strip()
+        if env_value:
+            return Path(env_value)
+    root = Path(root_dir) if root_dir is not None else PARENT_DIR
+    normalized = normalize_platform_key(platform)
+    preferred = platform_default_storage_state_name(normalized)
+    legacy_names = platform_legacy_storage_state_names(normalized)
+    candidates = [
+        root / "backend" / "data" / preferred,
+        root / "data" / preferred,
+    ]
+    for legacy_name in legacy_names:
+        candidates.extend(
+            [
+                root / "backend" / "data" / legacy_name,
+                root / "data" / legacy_name,
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return root / "data" / preferred
 
 
 # LLM concurrency settings

@@ -3,7 +3,7 @@
 .env.local
 
 # Browser data and profiles
-data/taobao_*.json
+data/*storage_state*.json
 data/*_profile/
 data/tmp_profile_test/
 data/tmp_*/
@@ -13,6 +13,8 @@ scripts/data/
 # Scraped data exports
 data/images/
 data/exports/
+data/debug_runs/
+data/reviews_exports/
 data/*.csv
 data/*.html
 data/*.json
@@ -35,6 +37,13 @@ build/
 # Logs
 *.log
 data/run_logs/
+.pytest_cache/
+pytest-cache-files-*/
+tmp_review_check_*/
+tmp_storage_restore_*/
+tmp_jd_fetch_*/
+tmp_debug_bundle_*/
+tmp_debug_workbook_*/
 
 # OS
 .DS_Store

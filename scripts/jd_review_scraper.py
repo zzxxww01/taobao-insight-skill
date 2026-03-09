@@ -8,6 +8,7 @@ import logging
 import math
 from typing import Any
 
+from config import LOGGER_NAME
 from data import clean_text, extract_json_object, normalize_brand_name, normalize_item_title, now_iso
 from jd_scraper import JDCrawler
 from review_common import (
@@ -31,7 +32,7 @@ from review_models import ReviewItemResult, ReviewRecord
 from tools.browser_manager import get_global_browser_manager
 from tools.jd_login_rules import detect_non_product_page
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 
 class JDReviewCrawler(JDCrawler):

@@ -18,8 +18,11 @@ from config import (
     ANTI_BOT_MARKERS,
     BANNED_SHOP_MARKER_RE,
     BRAND_RE,
+    LOGGER_NAME,
     SEARCH_BLOCK_HINT,
     SHOP_NAME_RE,
+    platform_default_profile_name,
+    platform_default_storage_state_name,
 )
 from data import (
     ItemDetail,
@@ -42,7 +45,7 @@ from scraper import (
     _http_fetch_text_with_cookie_header,
 )
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 # JD shows review/comment counts ("评论" / "评价") instead of "已售" / "人付款".
 # Define a separate regex so the shared SALES_TEXT_RE in config.py stays clean
@@ -176,8 +179,9 @@ def parse_jd_search_cards_from_html(html: str) -> list[dict[str, str]]:
 
 
 class JDSearchClient(BaseSearchClient):
-    DEFAULT_STORAGE_STATE_FILE = "jd_storage_state.json"
-    DEFAULT_USER_DATA_DIR_NAME = "jd_insight_profile"
+    PLATFORM_KEY = "jd"
+    DEFAULT_STORAGE_STATE_FILE = platform_default_storage_state_name(PLATFORM_KEY)
+    DEFAULT_USER_DATA_DIR_NAME = platform_default_profile_name(PLATFORM_KEY)
     PLATFORM_LABEL = "JD"
     LOGIN_HANDLER_CLS = JDLogin
     DETECT_NON_PRODUCT_PAGE_FN = staticmethod(detect_non_product_page)
@@ -579,8 +583,9 @@ class JDSearchClient(BaseSearchClient):
 
 
 class JDCrawler(BaseCrawler):
-    DEFAULT_STORAGE_STATE_FILE = "jd_storage_state.json"
-    DEFAULT_USER_DATA_DIR_NAME = "jd_insight_profile"
+    PLATFORM_KEY = "jd"
+    DEFAULT_STORAGE_STATE_FILE = platform_default_storage_state_name(PLATFORM_KEY)
+    DEFAULT_USER_DATA_DIR_NAME = platform_default_profile_name(PLATFORM_KEY)
     PLATFORM_LABEL = "JD"
     LOGIN_HANDLER_CLS = JDLogin
     DETECT_NON_PRODUCT_PAGE_FN = staticmethod(detect_non_product_page)

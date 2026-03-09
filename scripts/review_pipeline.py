@@ -12,7 +12,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from config import load_simple_dotenv
+from config import LOGGER_NAME, load_simple_dotenv, resolved_storage_state_file, resolved_user_data_dir
 from data import Storage, normalize_url
 from jd_review_scraper import JDReviewCrawler
 from review_service import ReviewCollectionService
@@ -20,7 +20,7 @@ from scraper import load_url_lines
 from taobao_review_scraper import TaobaoReviewCrawler
 from tools import cleanup_global_browser
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger(LOGGER_NAME)
 
 
 def print_json(payload: Any) -> None:
@@ -32,29 +32,12 @@ def print_json(payload: Any) -> None:
 
 
 def _default_user_data_dir(platform: str = "taobao") -> str:
-    profile_name = "jd_insight_profile" if platform == "jd" else "taobao_insight_profile"
-    appdata = os.getenv("APPDATA", "")
-    if appdata:
-        return str(Path(appdata) / profile_name)
-    if sys.platform == "darwin":
-        return str(Path.home() / "Library" / "Application Support" / profile_name)
-    return str(Path.home() / ".config" / profile_name)
+    return str(resolved_user_data_dir(platform))
 
 
 def _default_storage_state_file(platform: str = "taobao") -> str:
     env_key = "JD_STORAGE_STATE_FILE" if platform == "jd" else "TAOBAO_STORAGE_STATE_FILE"
-    default_name = "jd_storage_state.json" if platform == "jd" else "taobao_storage_state.json"
-    env_value = (os.getenv(env_key, "") or "").strip()
-    if env_value:
-        return env_value
-    candidates = [
-        Path(f"backend/data/{default_name}"),
-        Path(f"data/{default_name}"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return str(candidates[-1])
+    return str(resolved_storage_state_file(platform, env_key=env_key))
 
 
 def build_parser() -> argparse.ArgumentParser:

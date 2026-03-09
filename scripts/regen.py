@@ -68,7 +68,7 @@ from data import (
     should_reuse_search_page,
 )
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger("ecom_research_skill")
 
 """
     # 697 to 742 (detect_*, load_url_lines)
@@ -109,7 +109,7 @@ from data import (
     read_text_utf8_best,
 )
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger("ecom_research_skill")
 
 """
     # 3403 to 4913 (Gemini proxy, SellingPointExtractor, Analyzer)
@@ -141,7 +141,7 @@ from data import (
     read_text_utf8_best,
 )
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger("ecom_research_skill")
 
 """
     # 5401 to 6082 (export_csv, export_html)
@@ -192,16 +192,16 @@ from report import (
     export_html,
 )
 
-LOG = logging.getLogger("taobao_insight")
+LOG = logging.getLogger("ecom_research_skill")
 
 def _default_user_data_dir() -> str:
     from pathlib import Path
     appdata = os.getenv("APPDATA", "")
     if appdata:
-        return str(Path(appdata) / "taobao_insight_profile")
+        return str(Path(appdata) / "ecom_research_taobao_profile")
     if sys.platform == "darwin":
-        return str(Path.home() / "Library" / "Application Support" / "taobao_insight_profile")
-    return str(Path.home() / ".config" / "taobao_insight_profile")
+        return str(Path.home() / "Library" / "Application Support" / "ecom_research_taobao_profile")
+    return str(Path.home() / ".config" / "ecom_research_taobao_profile")
 
 """
     # 4968 to 5399 (Pipeline)

@@ -1,4 +1,4 @@
-# 淘宝/京东市场调研工具 (Taobao Insight)
+# 淘宝京东商品调研 (ecom-research-skill)
 
 > 一款 **Claude Code Skill**，通过原生 CDP 自动管理浏览器与登录状态，抓取淘宝/天猫/京东竞品数据，利用 Gemini AI 提炼产品卖点，生成市场分析报告（Markdown + HTML）。
 
@@ -23,17 +23,17 @@
 ```bash
 # macOS / Linux
 cd ~/.claude/skills
-git clone https://github.com/zzxxww01/taobao-insight-skill.git taobao-insight
+git clone https://github.com/zzxxww01/ecom-research-skill.git ecom-research-skill
 
 # Windows（PowerShell）
 cd "$env:USERPROFILE\.claude\skills"
-git clone https://github.com/zzxxww01/taobao-insight-skill.git taobao-insight
+git clone https://github.com/zzxxww01/ecom-research-skill.git ecom-research-skill
 ```
 
 ### 第二步：安装 Python 依赖
 
 ```bash
-cd taobao-insight
+cd ecom-research-skill
 pip install -r requirements.txt
 ```
 
@@ -139,8 +139,10 @@ python scripts/pipeline.py --crawl-workers 1 --llm-workers 64 final-csv "粉饼"
 
 | 平台 | Windows | macOS / Linux |
 |------|---------|---------------|
-| 淘宝/天猫 | `%APPDATA%\taobao_insight_profile` | `~/.config/taobao_insight_profile` |
-| 京东 | `%APPDATA%\jd_insight_profile` | `~/.config/jd_insight_profile` |
+| 淘宝/天猫 | `%APPDATA%\ecom_research_taobao_profile` | `~/.config/ecom_research_taobao_profile` |
+| 京东 | `%APPDATA%\ecom_research_jd_profile` | `~/.config/ecom_research_jd_profile` |
+
+> 若本机已存在旧目录 `taobao_insight_profile` / `jd_insight_profile` 或旧状态文件，程序会自动复用，避免重新扫码登录。
 
 ---
 
