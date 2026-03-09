@@ -69,6 +69,7 @@ class _BaseLogin:
     _cookie_domain_tokens: tuple[str, ...] = ()
     _search_dom_selector: str = ""
     _log_prefix: str = "[Login]"
+    _wait_trace_state: str = "WAIT"
     _wait_trace_note: str = "waiting for login"
     _cookie_updated_note: str = "cookie changed; keep page frozen until unblocked"
     _success_cookie_note: str = "cookie+page confirmed login success"
@@ -250,7 +251,7 @@ class _BaseLogin:
 
         while loop.time() < deadline:
             decision = await self._evaluate_login_decision()
-            self._append_trace("WAIT", decision, note=self._wait_trace_note)
+            self._append_trace(self._wait_trace_state, decision, note=self._wait_trace_note)
             current_cookie_fp = await self._login_cookie_fingerprint()
             cookie_changed = bool(current_cookie_fp) and current_cookie_fp != baseline_cookie_fp
 

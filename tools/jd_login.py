@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .jd_login_rules import (
@@ -22,6 +23,7 @@ class JDLogin(_BaseLogin):
     _cookie_domain_tokens = ("jd.com",)
     _search_dom_selector = "li.gl-item, .gl-item[data-sku], .j-sku-item"
     _log_prefix = "[JDLogin]"
+    _wait_trace_state = "WAIT_VERIFICATION"
     _wait_trace_note = "waiting for jd verification"
     _cookie_updated_note = "cookie changed; keep page frozen until it leaves blocked state"
     _success_cookie_note = "cookie+page confirmed verification success"
