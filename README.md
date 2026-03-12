@@ -1,5 +1,7 @@
 # 淘宝京东商品调研 (ecom-research-skill)
 
+> 更新说明：淘宝官方 MCP `taobao-native` 已上线，本项目中的淘宝相关功能已无继续保留的必要；新项目基于淘宝 MCP重写：[taobao-insight-skills](https://github.com/zzxxww01/taobao-insight-skills)。
+
 > 一款 **Claude Code Skill**，通过原生 CDP 自动管理浏览器与登录状态，抓取淘宝/天猫/京东竞品数据，利用 Gemini AI 提炼产品卖点，生成市场分析报告（Markdown + HTML）。
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
